@@ -6,11 +6,6 @@
 [depth]
 measurements = "./data/constant_depth_measurements.csv"
 
-# Labels based on segmentation of the reference image (e.g., obtained from manual annotation or from a segmentation routine)
-[labeling]
-colored_image = "./data/DSC28507_segmented.png"
-#colored_image = "./data/DSC28507_accurately_segmented.png"
-
 # Facies properties and mapping to labels in the segmented image
 [facies]
 props = "./data/facies.csv" # excel file with facies properties
@@ -49,32 +44,12 @@ dim = 2        # dimension of the model
 width = 0.90  # width of the model in m
 height = 0.49 # height of the model in m
 
-# Active and inactive corrections
-[corrections]
-
-# Type and size correction (for speed)
-[corrections.type]
-type = "float32"
-
-# TODO: Not supported for now!
-#[corrections.resize]
-#scale = 0.5
-
-[corrections.drift]
-colorchecker = "upper_right"
-
-# Calibration of curvature
-[corrections.curvature.crop]
-pts_src = [[5, 31], [2936, 38], [2949, 5374], [0, 5381]]
-width = 0.90
-height = 0.49
-
 [image_porosity]
 mode = "from_image" # or "from_image"
 tol = 0.9
 
 # Additional options for from_image mode:
-patches = [10, 10]
+patches = [5, 10]
 num_clusters = 5
 sample_width = 50
 tol_color_distance = 0.1
@@ -151,9 +126,6 @@ corner_2 = [0.89669993, 0.0024649299]
 # DATA SELECTION
 ######################################################
 
-[data.path.baseline]
-paths = ["DSC28507.JPG", "DSC28512.JPG", "DSC28517.JPG", "DSC28523.JPG", "DSC28527.JPG"]
-
 [data.interval.calibration1]
 start = "00:10:00"
 end = "02:30:00"
@@ -217,11 +189,12 @@ name = "ml4gcs_spatial_map_HH:MM"
 name = "ml4gcs_spatial_map_HH:MM"
 
 ##################################################
-# CALIBRATION
+# COLOR EMBEDDING
 ##################################################
 
-[color_paths]
-mode = "manual"
+[color.path.relative_colorpath]
+mode = "relative"
+calibration_mode = "manual"
 basis = "facies"
 ignore_labels = [0, 3, 4, 6]                     # water and top layer
 reference_label = 5                     # Main storage layer
@@ -235,8 +208,16 @@ num_segments = 3
 threshold_baseline = 0.0
 threshold_calibration = 1e-4
 
-[color_to_mass]
-basis = "facies"
+
+##################################################
+# CALIBRATION
+##################################################
+
+[calibration.color]
+color = "relative_colorpath"
+
+[calibration.mass]
+color = "relative_colorpath"
 data = ["calibration1", "calibration2"]
 rois = ["injection1", "injection2"]
 
@@ -258,6 +239,7 @@ concentration_aq = ["concentration1", "concentration2"]
 rescaled_concentration_aq = ["concentration1", "concentration2"]
 
 [analysis.mass]
+color = "relative_colorpath"
 export = ["mass", "extensive_rescaled_mass", "rescaled_saturation_g", "rescaled_concentration_aq"]
 
 [analysis.segmentation.aqueous]

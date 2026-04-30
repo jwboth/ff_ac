@@ -9,8 +9,36 @@ folders = ["\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Alb
 results = "E:\\ff_ml4gcs\\ac60"
 baseline = "DSC19883.JPG"
 
+[data.path.baseline]
+paths = ["DSC19883.JPG", "DSC19885.JPG", "DSC19887.JPG"]
+
 [protocols]
 imaging = "protocols/ac60/imaging_protocol.csv"                           # note: relative path!
 injection = "protocols/ac60/injection_protocol.csv"                       # note: relative path!
 pressure_temperature = "protocols/ac60/pressure_temperature_protocol.csv" # note: relative path!
-imaging_mode = "ctime"                                                    # "ctime" or "exif" - only for initialization - "ctime" faster but different!
+imaging_mode = "ctime"  # "ctime" or "exif" - only for initialization - "ctime" faster but different!
+
+# Labels based on segmentation of the reference image (e.g., obtained from manual annotation or from a segmentation routine)
+[labeling]
+colored_image = "./data/DSC28507_segmented.png"
+#colored_image = "./data/DSC28507_accurately_segmented.png"
+
+# Active and inactive corrections
+[corrections]
+
+# Type and size correction (for speed)
+[corrections.type]
+type = "float32"
+
+# TODO: Not supported for now!
+#[corrections.resize]
+#scale = 0.5
+
+[corrections.drift]
+colorchecker = "upper_right"
+
+# Calibration of curvature
+[corrections.curvature.crop]
+pts_src = [[0, 57], [3023, 64], [3000, 5378], [0, 5374]]
+width = 0.90
+height = 0.49                                                  

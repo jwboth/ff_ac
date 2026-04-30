@@ -9,6 +9,9 @@ folders = ["\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Alb
 results = "E:\\ff_ml4gcs\\ac14"
 baseline = "DSC28507.JPG"
 
+[data.path.baseline]
+paths = ["DSC28507.JPG", "DSC28512.JPG", "DSC28517.JPG", "DSC28523.JPG", "DSC28527.JPG"]
+
 [protocols]
 injection = "protocols/ac14/injection_protocol.csv"                       # note: relative path!
 pressure_temperature = "protocols/ac14/pressure_temperature_protocol.csv" # note: relative path!
@@ -17,3 +20,28 @@ imaging_mode = "ctime"                                                    # "cti
 [protocols.imaging]
 "\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_inj_220610_092900_30s" = "protocols/ac14/imaging_protocol_AC14_inj_220610_092900_30s.csv" # note: relative path!
 "\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_rest_220610_124500_5min" = "protocols/ac14/imaging_protocol_AC14_rest_220610_124500_5min.csv" # note: relative path!
+
+# Labels based on segmentation of the reference image (e.g., obtained from manual annotation or from a segmentation routine)
+[labeling]
+colored_image = "./data/DSC28507_segmented.png"
+#colored_image = "./data/DSC28507_accurately_segmented.png"
+
+# Active and inactive corrections
+[corrections]
+
+# Type and size correction (for speed)
+[corrections.type]
+type = "float32"
+
+# TODO: Not supported for now!
+#[corrections.resize]
+#scale = 0.5
+
+[corrections.drift]
+colorchecker = "upper_right"
+
+# Calibration of curvature
+[corrections.curvature.crop]
+pts_src = [[5, 31], [2936, 38], [2949, 5374], [0, 5381]]
+width = 0.90
+height = 0.49   
