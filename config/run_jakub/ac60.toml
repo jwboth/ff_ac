@@ -1,0 +1,16 @@
+##################################################
+# DATA AND METADATA
+##################################################
+[id]
+run_id = "Albus AC60"
+
+[data]
+folders = ["\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC60\\230707_095500_AC60_injection_30s"]
+results = "E:\\ff_ml4gcs\\ac60"
+baseline = "DSC19883.JPG"
+
+[protocols]
+imaging = "protocols/ac60/imaging_protocol.csv"                           # note: relative path!
+injection = "protocols/ac60/injection_protocol.csv"                       # note: relative path!
+pressure_temperature = "protocols/ac60/pressure_temperature_protocol.csv" # note: relative path!
+imaging_mode = "ctime"                                                    # "ctime" or "exif" - only for initialization - "ctime" faster but different!
