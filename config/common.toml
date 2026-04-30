@@ -226,11 +226,9 @@ rois = ["injection1", "injection2"]
 ######################################################
 
 [analysis]
-#data = ["calibration1"] #, "calibration2"]
-data = ["injection", "rest1", "rest2"]
-#data = ["remaining_rest2"]
-#data = ["injection"] #, "rest1", "rest2"]
-formats = ["final_jpg", "final_csv"]
+data = ["calibration1", "calibration2"]
+#data = ["injection", "rest1", "rest2"]
+formats = ["final_jpg"]
 
 [analysis.expert_knowledge]
 saturation_g = ["gas1", "gas2", "gas3", "gas4"]
