@@ -1,0 +1,19 @@
+##################################################
+# DATA AND METADATA
+##################################################
+[id]
+run_id = "Albus AC14"
+
+[data]
+folders = ["\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_inj_220610_092900_30s", "\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_rest_220610_124500_5min"]
+results = "E:\\ff_ml4gcs\\ac14"
+baseline = "DSC28507.JPG"
+
+[protocols]
+injection = "protocols/ac14/injection_protocol.csv"                       # note: relative path!
+pressure_temperature = "protocols/ac14/pressure_temperature_protocol.csv" # note: relative path!
+imaging_mode = "ctime"                                                    # "ctime" or "exif" - only for initialization - "ctime" faster but different!
+
+[protocols.imaging]
+"\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_inj_220610_092900_30s" = "protocols/ac14/imaging_protocol_AC14_inj_220610_092900_30s.csv" # note: relative path!
+"\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF3 Albus\\AC14_BM_green_220610\\AC14_rest_220610_124500_5min" = "protocols/ac14/imaging_protocol_AC14_rest_220610_124500_5min.csv" # note: relative path!
