@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ff_ac"
+version = "0.1.0"
+description = "DarSIA analysis for AC FF data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["darsia", "natsort", "pytest", "deepdiff"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+darsia = { path = "external/darsia", editable = true }
