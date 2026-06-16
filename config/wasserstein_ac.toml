@@ -1,0 +1,159 @@
+##################################################
+# AC cross-run Wasserstein multi-config (generated)
+##################################################
+[data]
+results = "Z:\\Albus\\Results\\wasserstein"
+
+# Common config added to every run, then each per-run config.
+[run.common]
+config = ["common.toml"]
+
+[run.ac17]
+config = "run_ac/ac17.toml"
+[run.ac18]
+config = "run_ac/ac18.toml"
+[run.ac19]
+config = "run_ac/ac19.toml"
+[run.ac20]
+config = "run_ac/ac20.toml"
+[run.ac21]
+config = "run_ac/ac21.toml"
+[run.ac22]
+config = "run_ac/ac22.toml"
+[run.ac23]
+config = "run_ac/ac23.toml"
+[run.ac24]
+config = "run_ac/ac24.toml"
+[run.ac25]
+config = "run_ac/ac25.toml"
+[run.ac26]
+config = "run_ac/ac26.toml"
+[run.ac27]
+config = "run_ac/ac27.toml"
+[run.ac28]
+config = "run_ac/ac28.toml"
+[run.ac29]
+config = "run_ac/ac29.toml"
+[run.ac30]
+config = "run_ac/ac30.toml"
+[run.ac31]
+config = "run_ac/ac31.toml"
+[run.ac32]
+config = "run_ac/ac32.toml"
+[run.ac33]
+config = "run_ac/ac33.toml"
+[run.ac34]
+config = "run_ac/ac34.toml"
+[run.ac35]
+config = "run_ac/ac35.toml"
+[run.ac38]
+config = "run_ac/ac38.toml"
+[run.ac39]
+config = "run_ac/ac39.toml"
+[run.ac40]
+config = "run_ac/ac40.toml"
+[run.ac41]
+config = "run_ac/ac41.toml"
+[run.ac42]
+config = "run_ac/ac42.toml"
+[run.ac43]
+config = "run_ac/ac43.toml"
+[run.ac44]
+config = "run_ac/ac44.toml"
+[run.ac45]
+config = "run_ac/ac45.toml"
+[run.ac46]
+config = "run_ac/ac46.toml"
+[run.ac47]
+config = "run_ac/ac47.toml"
+[run.ac48]
+config = "run_ac/ac48.toml"
+[run.ac49]
+config = "run_ac/ac49.toml"
+[run.ac50]
+config = "run_ac/ac50.toml"
+[run.ac51]
+config = "run_ac/ac51.toml"
+[run.ac52]
+config = "run_ac/ac52.toml"
+[run.ac53]
+config = "run_ac/ac53.toml"
+[run.ac54]
+config = "run_ac/ac54.toml"
+[run.ac55]
+config = "run_ac/ac55.toml"
+[run.ac56]
+config = "run_ac/ac56.toml"
+[run.ac57]
+config = "run_ac/ac57.toml"
+[run.ac58]
+config = "run_ac/ac58.toml"
+[run.ac59]
+config = "run_ac/ac59.toml"
+[run.ac60]
+config = "run_ac/ac60.toml"
+[run.ac61]
+config = "run_ac/ac61.toml"
+
+# ROIs. full = whole domain; box1 = I1 region, box2 = I2 region.
+[roi.full]
+name = "Full Domain"
+corner_1 = [0.0, 0.0]
+corner_2 = [0.9, 0.49]
+[roi.box1]
+name = "Box 1 (I1 / port 1 region)"
+corner_1 = [0.0, 0.0]
+corner_2 = [0.585, 0.49]
+[roi.box2]
+name = "Box 2 (I2 / port 2 region)"
+corner_1 = [0.585, 0.0]
+corner_2 = [0.9, 0.49]
+
+[wasserstein]
+runs = ["ac17", "ac18", "ac19", "ac20", "ac21", "ac22", "ac23", "ac24", "ac25", "ac26", "ac27", "ac28", "ac29", "ac30", "ac31", "ac32", "ac33", "ac34", "ac35", "ac38", "ac39", "ac40", "ac41", "ac42", "ac43", "ac44", "ac45", "ac46", "ac47", "ac48", "ac49", "ac50", "ac51", "ac52", "ac53", "ac54", "ac55", "ac56", "ac57", "ac58", "ac59", "ac60", "ac61"]
+roi = ["full", "box1", "box2"]
+resize = 0.1
+results = "Z:\\Albus\\Results\\wasserstein"
+
+# Shared time grid (hours since experiment start; HH:MM:SS).
+[wasserstein.data.interval.inj1_fine]
+start = "00:00:00"
+end = "00:10:00"
+num = 21
+tol = "00:00:15"
+
+[wasserstein.data.interval.inj1_body]
+start = "00:10:00"
+end = "00:55:00"
+num = 16
+tol = "00:01:30"
+
+[wasserstein.data.interval.inj2_onset]
+start = "00:55:00"
+end = "01:15:00"
+num = 11
+tol = "00:01:00"
+
+[wasserstein.data.interval.inj2_body]
+start = "01:15:00"
+end = "02:30:00"
+num = 16
+tol = "00:02:30"
+
+[wasserstein.data.interval.rest_early]
+start = "02:30:00"
+end = "06:00:00"
+num = 15
+tol = "00:07:00"
+
+[wasserstein.data.interval.rest_mid]
+start = "06:00:00"
+end = "24:00:00"
+num = 13
+tol = "01:30:00"
+
+[wasserstein.data.interval.rest_late]
+start = "24:00:00"
+end = "96:00:00"
+num = 10
+tol = "08:00:00"

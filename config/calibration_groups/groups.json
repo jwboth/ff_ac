@@ -1,0 +1,95 @@
+{
+  "0": {
+    "representative": "AC31",
+    "members": [
+      "AC20",
+      "AC31"
+    ]
+  },
+  "1": {
+    "representative": "AC26",
+    "members": [
+      "AC23",
+      "AC25",
+      "AC26",
+      "AC28",
+      "AC29",
+      "AC30",
+      "AC32",
+      "AC33",
+      "AC34",
+      "AC35",
+      "AC38"
+    ]
+  },
+  "2": {
+    "representative": "AC42",
+    "members": [
+      "AC41",
+      "AC42",
+      "AC43",
+      "AC44"
+    ]
+  },
+  "3": {
+    "representative": "AC22",
+    "members": [
+      "AC17",
+      "AC18",
+      "AC19",
+      "AC21",
+      "AC22",
+      "AC39"
+    ]
+  },
+  "4": {
+    "representative": "AC27",
+    "members": [
+      "AC24",
+      "AC27"
+    ]
+  },
+  "5": {
+    "representative": "AC48",
+    "members": [
+      "AC45",
+      "AC46",
+      "AC47",
+      "AC48",
+      "AC49"
+    ]
+  },
+  "6": {
+    "representative": "AC51",
+    "members": [
+      "AC51"
+    ]
+  },
+  "7": {
+    "representative": "AC50",
+    "members": [
+      "AC50"
+    ]
+  },
+  "8": {
+    "representative": "AC53",
+    "members": [
+      "AC40",
+      "AC52",
+      "AC53"
+    ]
+  },
+  "9": {
+    "representative": "AC58",
+    "members": [
+      "AC54",
+      "AC55",
+      "AC56",
+      "AC57",
+      "AC58",
+      "AC59",
+      "AC60",
+      "AC61"
+    ]
+  }
+}

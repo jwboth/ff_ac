@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "DarSIA analysis for AC FF data"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["darsia", "natsort", "pytest", "deepdiff"]
+dependencies = [
+    "darsia",
+    "natsort",
+    "pytest",
+    "deepdiff",
+    "optuna>=4.9.0",
+]
 
 [tool.uv]
 package = false

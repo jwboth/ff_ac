@@ -1,0 +1,319 @@
+##################################################
+# METADATA
+##################################################
+
+# Depth measurements
+[depth]
+measurements = "./data/constant_depth_measurements.csv"
+
+# Facies properties and mapping to labels in the segmented image
+[facies]
+props = "./data/facies.csv" # excel file with facies properties
+
+[facies.0] # water
+#labels = [1]
+labels = [1,2]
+[facies.1] # ESF
+labels = [3, 12, 14]
+[facies.2] # C
+labels = [7, 10]
+[facies.3] # D
+labels = []
+[facies.4] # E
+#labels = [2,6, 8]
+labels = []
+[facies.5] # F
+#labels = [0, 4, 5, 9, 11, 13]
+labels = [9, 11]
+[facies.6] # G
+labels = []
+[facies.7] # F2
+labels = [4, 5, 6, 8]
+#labels = []
+[facies.8] # F3
+labels = [0, 13]
+#labels = []
+
+##################################################
+# GEOMETRY
+##################################################
+
+# Dimensions of the rig
+[rig]
+dim = 2        # dimension of the model
+width = 0.90  # width of the model in m
+height = 0.49 # height of the model in m
+
+[image_porosity]
+mode = "from_image" # or "from_image"
+tol = 0.9
+
+# Additional options for from_image mode:
+patches = [5, 10]
+num_clusters = 5
+sample_width = 50
+tol_color_distance = 0.1
+tol_color_gradient = 0.02
+
+##################################################
+# IMAGE PROCESSING
+##################################################
+
+# Denoising using a simple averaging filter.
+[restoration]
+method = "volume_average"
+
+[restoration.options]
+rev_size = 0.01 # meters
+
+######################################################
+# ROIs
+######################################################
+
+[roi.full]
+name = "Full Domain"
+corner_1 = [0.0, 0.0]
+corner_2 = [0.899, 0.492]
+
+[roi.calibration]
+name = "Full Domain Without CC"
+corner_1 = [0.0, 0.0]
+corner_2 = [0.899, 0.4]
+
+[roi.injection1]
+name = "Box around injection 1"
+corner_1 = [0.0, 0.0]
+corner_2 = [0.8, 0.18]
+
+[roi.injection2]
+name = "Box around injection 2"
+corner_1 = [0.0, 0.15]
+corner_2 = [0.899, 0.4]
+
+[roi.gas1]
+name = "Gas cap port 1"
+corner_1 = [0.055201754, 0.14066533]
+corner_2 = [0.49500859, 0.083807615]
+
+[roi.gas2]
+name = "Gas injection port 1"
+corner_1 = [0.35782566, 0.13852906]
+corner_2 = [0.51176626, 0.025635271]
+
+[roi.gas3]
+name = "Gas injection port 2"
+corner_1 = [0.65732803, 0.32422044]
+corner_2 = [0.85349141, 0.15331864]
+
+[roi.gas4]
+name = "Gas cap port 2"
+corner_1 = [0.038279788, 0.35905812]
+corner_2 = [0.66685691, 0.29891383]
+
+[roi.concentration1]
+name = "Active region 1"
+corner_1 = [0.0014786184, 0.4065491]
+corner_2 = [0.70382237, 0.00016432866]
+
+[roi.concentration2]
+name = "Active region 2"
+corner_1 = [0.61313377, 0.34114629]
+corner_2 = [0.89669993, 0.0024649299]
+
+
+
+######################################################
+# DATA SELECTION
+######################################################
+
+[data.interval.calibration1]
+start = "00:10:00"
+end = "02:30:00"
+num = 5
+tol = "00:01:00"
+
+[data.interval.calibration2]
+start = "03:00:00"
+end = "48:00:00"
+num = 5
+tol = "00:05:00"
+
+[data.interval.calibration3]
+start = "03:00:00"
+end = "12:00:00"
+num = 5
+tol = "00:05:00"
+
+[data.interval.injection]
+start = "00:00:00"
+end = "02:30:00"
+num = 76 # dt = 2 minutes 
+tol = "00:00:30"
+
+[data.interval.rest1]
+start = "02:30:00"
+end = "12:00:00"
+num = 58 # dt = 10 minutes 
+tol = "00:05:00"
+
+[data.interval.rest2]
+start = "12:00:00"
+end = "72:00:00"
+num = 121 # dt = 30 minutes 
+tol = "00:05:00"
+
+[data.interval.remaining_rest2]
+start = "66:00:00"
+end = "72:00:00"
+num = 13 # dt = 30 minutes 
+tol = "00:05:00"
+
+#####################################
+# FORMATS
+#####################################
+
+[format.jpg.final_jpg]
+resolution = [1080, 4]
+keep_ratio = true
+name = "ml4gcs_spatial_map_HH:MM"
+cmap = "color_path.from_facies.5"
+quality=100
+
+[format.csv.final_csv]
+resolution = [196, 360]
+keep_ratio = false
+float_format = "{:.3e}"
+name = "ml4gcs_spatial_map_HH:MM"
+
+[format.npz.npz]
+name = "ml4gcs_spatial_map_HH:MM"
+
+##################################################
+# COLOR EMBEDDING
+##################################################
+
+[color.path.relative_colorpath]
+mode = "relative"
+calibration_mode = "auto"
+basis = "facies"
+ignore_labels = [0, 3, 4, 6]                     # water and top layer
+reference_label = 5                     # Main storage layer
+data = ["calibration1", "calibration2"]
+baseline = "baseline"
+rois = ["calibration"]
+ignore_baseline_spectrum = "baseline"
+histogram_weighting = "wls"
+resolution = 21
+num_segments = 6
+threshold_baseline = 0.0
+threshold_calibration = 1e-4
+
+
+##################################################
+# CALIBRATION
+##################################################
+
+[calibration.color]
+color = "relative_colorpath"
+
+[calibration.mass]
+color = "relative_colorpath"
+data = ["calibration1", "calibration2"]
+rois = ["injection1", "injection2"]
+
+######################################################
+# ANALYSIS
+######################################################
+
+[analysis]
+data = ["calibration1", "calibration2"]
+#data = ["injection", "rest1", "rest2"]
+formats = ["final_jpg"]
+
+[analysis.expert_knowledge]
+saturation_g = ["gas1", "gas2", "gas3", "gas4"]
+rescaled_saturation_g = ["gas1", "gas2", "gas3", "gas4"]
+concentration_aq = ["concentration1", "concentration2"]
+rescaled_concentration_aq = ["concentration1", "concentration2"]
+
+[analysis.mass]
+color = "relative_colorpath"
+export = ["mass", "extensive_rescaled_mass", "rescaled_saturation_g", "rescaled_concentration_aq"]
+
+[analysis.segmentation.aqueous]
+label = "CO2(aq)"
+mode = "rescaled_concentration_aq"
+thresholds = [0.05, 0.3, 0.5]
+color = [120, 210, 255]
+alpha = [0.5, 0.75, 1.0]
+linewidth = 16
+show_values = false
+value_color = [255, 255, 255]
+value_size = 4
+value_alpha = 0.8
+value_density = 0.5
+value_min_distance_px = 35
+value_max_per_contour = 4
+value_format = "{:.2f}"
+
+[analysis.segmentation.gas]
+label = "CO2(g)"
+mode = "rescaled_saturation_g"
+thresholds = [0.001]
+color = [0, 0, 150]
+alpha = [1.0]
+linewidth = 16
+
+#####################################
+# HELPER
+#####################################
+
+[helper.roi]
+data = "calibration2"
+
+[helper.roi_viewer]
+data = "calibration2"
+
+[helper.results]
+data = "calibration2"
+mode = "extensive_rescaled_mass"
+format = "csv"
+
+######################################################
+# UTILS
+######################################################
+
+# For download of raw images to local filesystem
+#[download]
+#source = "\\\\klient.uib.no\\FELLES\\LAB-IT\\IFT\\resfys\\FluidFlower\\FF2 24-25 glass beads\\050825_glass_beads_1_150_s"
+
+[video]
+
+[video.source]
+folder = "segmentation/final_jpg" # relative to [data.results] when not absolute
+#folder = "mass/final_jpg" # relative to [data.results] when not absolute
+#folder = "cropping" # relative to [data.results] when not absolute
+#extensions = [".jpg"]
+recursive = false
+sorting = "name"
+
+[video.output]
+formats = ["mp4"]
+fps = 6.0
+codec = "mp4v"
+quality = 100
+# resolution = [1280, 720] # optional [width, height]
+
+[video.overlay]
+show_elapsed_time = false
+elapsed_time_format = "Elapsed: {:.2f} h"
+show_note = true
+note = "FluidFlower AC"
+font_scale = 0.5
+thickness = 2
+text_color = [255, 255, 255]
+position = [20, 20]
+box_enabled = true
+box_color = [0, 0, 0]
+box_alpha = 0.4
+box_padding = 10

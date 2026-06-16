@@ -1,0 +1,10 @@
+{
+  "ac60": {
+    "flash.max_value_aq": [1.0, 1.0],
+    "flash.min_value_g": [0.75, 0.75],
+    "flash.max_value_g": [1.5, 1.5],
+    "signal.label*.value1": [0.0, 2.0],
+    "signal.label*.value2": [0.0, 2.0],
+    "signal.label*.value3": [0.0, 2.0]
+  }
+}

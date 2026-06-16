@@ -1,0 +1,15 @@
+# Colour-correction overlay (the master --color-correction=on state).
+#
+# This is layered ON TOP of [common.toml, run_ac/<rep>.toml] via the config list, so
+# the deep-merge adds [corrections.color] to whatever corrections the run already has
+# (drift + curvature). It enables darsia.find_colorchecker on the upper-right Classic
+# ColorChecker and the per-frame correction (linearised fit + residual flagging).
+#
+# Usage (prep + run must BOTH include this overlay for the color=on state):
+#   python scripts/setup.py       --config common.toml run_ac/<rep>.toml coloron.toml --rig
+#   python scripts/calibration.py --config common.toml run_ac/<rep>.toml coloron.toml --color-embedding
+#   python scripts/calibration.py --config common.toml run_ac/<rep>.toml coloron.toml --default-mass --reset
+#
+# Leave it OUT of the config list for the color=off state.
+[corrections.color]
+colorchecker = "upper_right"

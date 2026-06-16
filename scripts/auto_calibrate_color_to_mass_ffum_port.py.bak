@@ -1,0 +1,3334 @@
+"""Automate color-to-mass calibration search (Optuna, non-interactive)."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import fnmatch
+import json
+import logging
+import os
+import random
+import re
+import socket
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import numpy as np
+import optuna
+from optuna.distributions import IntUniformDistribution, UniformDistribution
+
+import darsia
+from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
+from darsia.presets.workflows.heterogeneous_color_to_mass_analysis import (
+    HeterogeneousColorToMassAnalysis,
+)
+
+logger = logging.getLogger(__name__)
+
+# Large penalty returned when calibration fails or violates constraints.
+PENALTY_VALUE = 1e12
+DEFAULT_IMAGE_CACHE_SIZE = 2
+
+# Default parameter definitions (per supervisor spec)
+PARAM_SPACE_TEMPLATE: List[Dict[str, Any]] = [
+    {
+        "name": "signal.label0.value0",
+        "attr_path": ["signal_model", "model", 1, 0, "values", 0],
+        "bounds": (0.0, 0.0),  # locked at 0
+        "type": "float",
+    },
+    *[
+        {
+            "name": f"signal.label0.value{i}",
+            "attr_path": ["signal_model", "model", 1, 0, "values", i],
+            "bounds": (0.0, 2.0),
+            "type": "float",
+        }
+        for i in range(1, 4)  # ff_ac: 4-support signal model (value1..3 free)
+    ],
+    {
+        "name": "flash.min_value_aq",
+        "attr_path": ["flash", "min_value_aq"],
+        "bounds": (0.0, 0.0),  # locked at 0
+        "type": "float",
+    },
+    {
+        "name": "flash.max_value_aq",
+        "attr_path": ["flash", "max_value_aq"],
+        "bounds": (0.75, 0.75),  # ff_ac flash default
+        "type": "float",
+    },
+    {
+        "name": "flash.min_value_g",
+        "attr_path": ["flash", "min_value_g"],
+        "bounds": (0.75, 0.75),  # ff_ac flash default
+        "type": "float",
+    },
+    {
+        "name": "flash.max_value_g",
+        "attr_path": ["flash", "max_value_g"],
+        "bounds": (1.0, 1.0),  # ff_ac flash default
+        "type": "float",
+    },
+]
+
+_SIGNAL_PARAM_RE = re.compile(r"^signal\.label(?P<label>-?\d+)\.value(?P<idx>\d+)$")
+
+
+def _parse_signal_name(name: str) -> Optional[Tuple[int, int]]:
+    match = _SIGNAL_PARAM_RE.match(name)
+    if not match:
+        return None
+    try:
+        return int(match.group("label")), int(match.group("idx"))
+    except ValueError:
+        return None
+
+
+def _parse_param_ranges(raw: Optional[str]) -> Dict[int, Tuple[float, float]]:
+    """Parse per-value ranges like 'value2=0,1;value6=0,2'."""
+    ranges: Dict[int, Tuple[float, float]] = {}
+    if not raw:
+        return ranges
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip().lower()
+        if key.startswith("value"):
+            key = key[5:]
+        try:
+            idx = int(key)
+        except ValueError:
+            continue
+        bounds = [x.strip() for x in val.split(",") if x.strip()]
+        if len(bounds) != 2:
+            continue
+        try:
+            low = float(bounds[0])
+            high = float(bounds[1])
+        except ValueError:
+            continue
+        ranges[idx] = (low, high)
+    return ranges
+
+
+def _parse_param_levels(raw: Optional[str]) -> Tuple[Optional[int], Dict[int, int]]:
+    """Parse per-value level counts. Accepts '8' or 'value2=8;value6=6'."""
+    if not raw:
+        return None, {}
+    raw = raw.strip()
+    if "=" not in raw and ";" not in raw:
+        try:
+            return int(raw), {}
+        except ValueError:
+            return None, {}
+    levels: Dict[int, int] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip().lower()
+        if key.startswith("value"):
+            key = key[5:]
+        try:
+            idx = int(key)
+            count = int(val.strip())
+        except ValueError:
+            continue
+        levels[idx] = count
+    return None, levels
+
+
+def _extend_signal_values(
+    space: List[Dict[str, Any]],
+    max_idx: int,
+) -> List[Dict[str, Any]]:
+    signal_entries: List[Dict[str, Any]] = []
+    other_entries: List[Dict[str, Any]] = []
+    existing_idxs: set[int] = set()
+    for entry in space:
+        parsed = _parse_signal_name(entry["name"])
+        if parsed:
+            existing_idxs.add(parsed[1])
+            signal_entries.append(entry)
+        else:
+            other_entries.append(entry)
+    for idx in range(1, max_idx + 1):
+        if idx in existing_idxs:
+            continue
+        signal_entries.append(
+            {
+                "name": f"signal.label0.value{idx}",
+                "attr_path": ["signal_model", "model", 1, 0, "values", idx],
+                "bounds": (0.0, 2.0),
+                "type": "float",
+            }
+        )
+    return signal_entries + other_entries
+
+
+def _linspace(low: float, high: float, count: int) -> List[float]:
+    if count <= 1:
+        return [float(low)]
+    step = (high - low) / float(count - 1)
+    return [float(low + step * i) for i in range(count)]
+
+
+def _apply_param_ranges(
+    bounds_map: Dict[str, Dict[str, Tuple[float, float]]],
+    runs: Sequence[str],
+    param_ranges: Dict[int, Tuple[float, float]],
+) -> Dict[str, Dict[str, Tuple[float, float]]]:
+    if not param_ranges:
+        return bounds_map
+    for run in runs:
+        override = bounds_map.setdefault(run, {})
+        for idx, bounds in param_ranges.items():
+            override[f"signal.label*.value{idx}"] = bounds
+    return bounds_map
+
+
+def _parse_label_weights(text: Optional[str]) -> Dict[int, float]:
+    if not text:
+        return {}
+    weights: Dict[int, float] = {}
+    for chunk in text.split(";"):
+        if not chunk.strip():
+            continue
+        if "=" not in chunk:
+            continue
+        key, raw = chunk.split("=", 1)
+        try:
+            label = int(key.strip())
+            weight = float(raw.strip())
+        except Exception:
+            continue
+        weights[label] = weight
+    return weights
+
+
+def _parse_bool(value):
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in ("1", "true", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Automatic color-to-mass calibration parameter search (non-interactive)."
+    )
+    parser.add_argument("--runs", nargs="+", required=True, help="Run names (matching config/<run>.toml).")
+    parser.add_argument("--mode", choices=["per-run", "global"], default="per-run")
+    parser.add_argument("--max-iters", type=int, default=40)
+    parser.add_argument("--logs-dir", type=str, default="logs")
+    parser.add_argument("--config-dir", type=str, default="config/run_ac")
+    parser.add_argument("--ref-config", type=str, default=None)
+    parser.add_argument("--use-facies", action="store_true")
+    parser.add_argument(
+        "--per-label",
+        action="store_true",
+        help="Use unique signal parameters per label (default is shared across labels).",
+    )
+    parser.add_argument(
+        "--use-label-weights",
+        action="store_true",
+        help="Enable label weighting in the objective.",
+    )
+    parser.add_argument(
+        "--auto-label-weights",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_parse_bool,
+        help="Derive label weights automatically from calibration image changes (true/false).",
+    )
+    parser.add_argument(
+        "--label-weight-grouping",
+        default="none",
+        choices=["none", "facies"],
+        help="Normalize label weights by group (e.g. facies) when use_facies=false.",
+    )
+    parser.add_argument(
+        "--label-weights",
+        type=str,
+        default=None,
+        help="Per-label weights: '7=1.0;8=0.5'. Requires --use-label-weights.",
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=100,
+        help="Additional random warmup evaluations (added to the warmup grid).",
+    )
+    parser.add_argument(
+        "--warmup-levels",
+        type=str,
+        default=None,
+        help="Comma-separated levels for monotonic warmup sweeps (e.g. '1.0,0.75,0.5').",
+    )
+    parser.add_argument(
+        "--param-ranges",
+        type=str,
+        default=None,
+        help="Per-value bounds overrides (apply to warmup + Optuna). Format: 'value2=0,1;value6=0,2'.",
+    )
+    parser.add_argument(
+        "--param-levels",
+        type=str,
+        default=None,
+        help="Per-value warmup level counts. Format: '8' or 'value2=8;value6=6'.",
+    )
+    parser.add_argument(
+        "--warmup-high",
+        type=float,
+        default=None,
+        help="Optional cap for warmup high values (applies to signal.label*.value1..N).",
+    )
+    parser.add_argument(
+        "--warmup-mode",
+        choices=["prefix", "suffix", "single"],
+        default="prefix",
+        help="Warmup sweep mode: prefix, suffix, or single (legacy).",
+    )
+    parser.add_argument(
+        "--allow-over-injected",
+        dest="enforce_lower",
+        action="store_false",
+        help="If set, do not penalize total>injected; aim for best fit regardless of constraint.",
+    )
+    parser.add_argument(
+        "--enforce-lower",
+        dest="enforce_lower",
+        action="store_true",
+        help="Penalize any total>injected (default behavior).",
+    )
+    parser.set_defaults(enforce_lower=True)
+    parser.add_argument(
+        "--bounds-file",
+        type=str,
+        default=None,
+        help="Optional JSON with bounds overrides. Format: {'default': {'param': [low, high]}, 'run6': {...}}",
+    )
+    parser.add_argument(
+        "--init-from-best",
+        type=str,
+        default=None,
+        help="Path to a history CSV whose best entry seeds the search (evaluated first).",
+    )
+    parser.add_argument(
+        "--quality-scale",
+        type=float,
+        default=1.0,
+        help="Downscale factor for all evaluations (1.0 = full resolution).",
+    )
+    parser.add_argument(
+        "--quality-dtype",
+        type=str,
+        default=None,
+        help="Numeric dtype override for evaluations (float32/float64).",
+    )
+    parser.add_argument(
+        "--objective-integral",
+        default="off",
+        choices=["off", "l1", "l2"],
+        help="Integral objective over time: off (point-wise), l1, or l2.",
+    )
+    return parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Helpers for parameter sampling and application
+
+
+def _value_entries_by_label(
+    param_space: Sequence[Dict[str, Any]]
+) -> Dict[int, List[Dict[str, Any]]]:
+    entries_by_label: Dict[int, List[Dict[str, Any]]] = {}
+    for entry in param_space:
+        name = entry.get("name", "")
+        parsed = _parse_signal_name(name)
+        if not parsed:
+            continue
+        label, idx = parsed
+        entries_by_label.setdefault(label, []).append(entry)
+    for label, entries in entries_by_label.items():
+        entries_by_label[label] = sorted(
+            entries, key=lambda e: _parse_signal_name(e["name"])[1]
+        )
+    return entries_by_label
+
+
+def _monotonic_bounds(entries: Sequence[Dict[str, Any]]) -> Tuple[List[float], List[float]]:
+    lows = [float(e["bounds"][0]) for e in entries]
+    highs = [float(e["bounds"][1]) for e in entries]
+    lower: List[float] = []
+    for i, low in enumerate(lows):
+        lower.append(low if i == 0 else max(low, lower[i - 1]))
+    upper: List[float] = [0.0] * len(entries)
+    if entries:
+        upper[-1] = highs[-1]
+        for i in range(len(entries) - 2, -1, -1):
+            upper[i] = min(highs[i], upper[i + 1])
+    for i, (lo, hi) in enumerate(zip(lower, upper)):
+        if lo > hi:
+            name = entries[i]["name"]
+            raise ValueError(f"Infeasible monotonic bounds for {name}: {lo} > {hi}")
+    return lower, upper
+
+
+def _project_monotonic_values(values: Sequence[float], entries: Sequence[Dict[str, Any]]) -> List[float]:
+    if not entries:
+        return []
+    if len(values) != len(entries):
+        raise ValueError("Value count mismatch for monotonic projection.")
+    lower, upper = _monotonic_bounds(entries)
+    projected: List[float] = []
+    prev = None
+    for i, raw in enumerate(values):
+        min_i = lower[i] if prev is None else max(lower[i], prev)
+        max_i = upper[i]
+        projected_val = min(max(float(raw), min_i), max_i)
+        projected.append(projected_val)
+        prev = projected_val
+    return projected
+
+
+def sample_params(param_space: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    samples: Dict[str, Any] = {}
+    val_entries_by_label = _value_entries_by_label(param_space)
+    for _, entries in val_entries_by_label.items():
+        raw_vals: List[float] = []
+        for entry in entries:
+            low, high = entry["bounds"]
+            if low == high:
+                raw_vals.append(float(low))
+            else:
+                raw_vals.append(float(random.uniform(low, high)))
+        if entries:
+            sorted_vals = sorted(raw_vals)
+            projected = _project_monotonic_values(sorted_vals, entries)
+            for entry, val in zip(entries, projected):
+                samples[entry["name"]] = val
+    for entry in param_space:
+        if entry["name"] in samples:
+            continue
+        low, high = entry["bounds"]
+        if entry.get("type", "float") == "int":
+            samples[entry["name"]] = int(round(random.uniform(low, high)))
+        else:
+            samples[entry["name"]] = random.uniform(low, high)
+    return samples
+
+
+def suggest_params_trial(trial: optuna.Trial, param_space: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    val_entries_by_label = _value_entries_by_label(param_space)
+    for _, entries in val_entries_by_label.items():
+        raw_vals: List[float] = []
+        for entry in entries:
+            low, high = entry["bounds"]
+            if low == high:
+                raw_vals.append(float(low))
+            else:
+                raw_vals.append(
+                    trial.suggest_float(f"raw_{entry['name']}", float(low), float(high))
+                )
+        if entries:
+            sorted_vals = sorted(raw_vals)
+            projected = _project_monotonic_values(sorted_vals, entries)
+            for entry, val in zip(entries, projected):
+                params[entry["name"]] = val
+    for entry in param_space:
+        if entry["name"] in params:
+            continue
+        low, high = entry["bounds"]
+        if entry.get("type", "float") == "int":
+            params[entry["name"]] = trial.suggest_int(entry["name"], int(low), int(high))
+        else:
+            params[entry["name"]] = trial.suggest_float(entry["name"], float(low), float(high))
+    return params
+
+
+def _detect_per_label_params(
+    params: Mapping[str, Any],
+    param_space: Optional[Sequence[Dict[str, Any]]],
+) -> bool:
+    labels: set[int] = set()
+    for name in params.keys():
+        parsed = _parse_signal_name(name)
+        if parsed:
+            labels.add(parsed[0])
+            if len(labels) > 1:
+                return True
+    if labels and labels != {0}:
+        return True
+    if param_space:
+        space_labels: set[int] = set()
+        for entry in param_space:
+            parsed = _parse_signal_name(entry.get("name", ""))
+            if parsed:
+                space_labels.add(parsed[0])
+                if len(space_labels) > 1:
+                    return True
+        if space_labels and space_labels != {0}:
+            return True
+    return False
+
+
+def apply_params_to_calibration(
+    calib: HeterogeneousColorToMassAnalysis,
+    params: Mapping[str, Any],
+    param_space: Optional[Sequence[Dict[str, Any]]] = None,
+    per_label: Optional[bool] = None,
+) -> None:
+    space = param_space or PARAM_SPACE_TEMPLATE
+    if per_label is None:
+        per_label = _detect_per_label_params(params, space)
+    path_lookup = {entry["name"]: entry["attr_path"] for entry in space}
+
+    signal_values_by_label: Dict[int, Dict[int, float]] = {}
+    for name, value in params.items():
+        parsed = _parse_signal_name(name)
+        if not parsed:
+            continue
+        label, idx = parsed
+        signal_values_by_label.setdefault(label, {})[idx] = float(value)
+
+    def _update_func_values(func, values_map: Dict[int, float]) -> None:
+        values = getattr(func, "values", None)
+        if values is None:
+            return
+        new_values = np.array(values, dtype=float)
+        for idx, val in values_map.items():
+            if 0 <= idx < len(new_values):
+                new_values[idx] = val
+        # Enforce non-decreasing values to satisfy PWTransformation checks.
+        if new_values.size > 1:
+            new_values = np.maximum.accumulate(new_values)
+        func.update(values=new_values)
+
+    if signal_values_by_label:
+        hetero = _get_signal_hetero_model(calib)
+        if hetero is not None:
+            try:
+                labels = list(hetero.keys())
+            except Exception:
+                labels = []
+            label_key_map: Dict[int, Any] = {}
+            for key in labels:
+                try:
+                    label_key_map[int(key)] = key
+                except Exception:
+                    continue
+            if per_label:
+                for label, values_map in signal_values_by_label.items():
+                    target_key = label_key_map.get(label)
+                    if target_key is None:
+                        continue
+                    try:
+                        _update_func_values(hetero[target_key], values_map)
+                    except Exception:
+                        continue
+            else:
+                ref_label = 0 if 0 in signal_values_by_label else next(
+                    iter(signal_values_by_label.keys())
+                )
+                shared_values = signal_values_by_label[ref_label]
+                for key in label_key_map.values():
+                    try:
+                        _update_func_values(hetero[key], shared_values)
+                    except Exception:
+                        continue
+        else:
+            for label, values_map in signal_values_by_label.items():
+                for idx, value in values_map.items():
+                    key = f"signal.label{label}.value{idx}"
+                    if key in path_lookup:
+                        _set_attr_path(calib, path_lookup[key], value)
+
+    for name, value in params.items():
+        if _parse_signal_name(name):
+            continue
+        if name not in path_lookup:
+            continue
+        _set_attr_path(calib, path_lookup[name], value)
+
+
+def _set_attr_path(obj: Any, path: Sequence[Union[str, int]], value: Any) -> None:
+    cursor = obj
+    for key in path[:-1]:
+        cursor = _get_next(cursor, key)
+        if cursor is None:
+            logger.debug("Skip setting %s because %s missing.", path, key)
+            return
+    last = path[-1]
+    if isinstance(cursor, MutableMapping):
+        cursor[last] = value  # type: ignore[index]
+    elif isinstance(last, int):
+        if isinstance(cursor, (list, tuple, np.ndarray)):
+            if 0 <= last < len(cursor):
+                cursor[last] = value
+            else:
+                logger.debug("Index %s out of range for path %s (len=%s); skipping", last, path, len(cursor))
+        elif hasattr(cursor, "__setitem__") and hasattr(cursor, "__len__"):
+            try:
+                if 0 <= last < len(cursor):  # type: ignore[arg-type]
+                    cursor[last] = value  # type: ignore[index]
+                else:
+                    logger.debug("Index %s out of range for path %s (len=%s); skipping", last, path, len(cursor))
+            except Exception:
+                return
+    else:
+        if hasattr(cursor, last):
+            setattr(cursor, last, value)
+        elif isinstance(cursor, dict):
+            cursor[last] = value
+
+
+def _get_next(obj: Any, key: Union[str, int]) -> Any:
+    if isinstance(key, int):
+        if isinstance(obj, list):
+            return obj[key] if 0 <= key < len(obj) else None
+        if hasattr(obj, "__getitem__"):
+            try:
+                return obj[key]
+            except Exception:
+                return None
+    if isinstance(obj, MutableMapping):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _get_attr_path(obj: Any, path: Sequence[Union[str, int]]) -> Any:
+    cursor = obj
+    for key in path:
+        cursor = _get_next(cursor, key)
+        if cursor is None:
+            return None
+    return cursor
+
+
+def _probe_signal_model(calib: Any, ref_label: Optional[int]) -> Dict[str, Any]:
+    info: Dict[str, Any] = {}
+    sig = getattr(calib, "signal_model", None)
+    info["signal_model_type"] = type(sig).__name__ if sig is not None else None
+    model = getattr(sig, "model", None) if sig is not None else None
+    info["model_type"] = type(model).__name__ if model is not None else None
+    models = getattr(model, "models", None) if model is not None else None
+    if isinstance(models, list):
+        info["models_len"] = len(models)
+        info["models_types"] = [type(m).__name__ for m in models]
+    hetero = None
+    if model is not None:
+        try:
+            hetero = model[1]
+        except Exception as exc:
+            info["hetero_error"] = str(exc)
+    if hetero is None and isinstance(models, list) and len(models) > 1:
+        hetero = models[1]
+    if hetero is None:
+        return info
+    try:
+        labels = sorted(list(hetero.keys()))
+        info["labels"] = labels[:20]
+        info["labels_total"] = len(labels)
+    except Exception as exc:
+        info["labels_error"] = str(exc)
+    for label in [0, ref_label]:
+        if label is None:
+            continue
+        try:
+            func = hetero[label]
+            values = getattr(func, "values", None)
+            if values is not None:
+                info[f"label_{label}_values_len"] = len(values)
+                info[f"label_{label}_values_head"] = [float(v) for v in values[:8]]
+            else:
+                info[f"label_{label}_values_len"] = None
+        except Exception as exc:
+            info[f"label_{label}_error"] = str(exc)
+    return info
+
+
+def _get_signal_hetero_model(calib: Any) -> Any:
+    sig = getattr(calib, "signal_model", None)
+    model = getattr(sig, "model", None) if sig is not None else None
+    hetero = None
+    if model is not None:
+        try:
+            hetero = model[1]
+        except Exception:
+            hetero = None
+    if hetero is None:
+        models = getattr(model, "models", None) if model is not None else None
+        if isinstance(models, list) and len(models) > 1:
+            hetero = models[1]
+    return hetero
+
+
+def _resolve_signal_label(calib: Any, reference_label: int) -> Optional[int]:
+    hetero = _get_signal_hetero_model(calib)
+    if hetero is None:
+        return None
+    try:
+        labels = list(hetero.keys())
+    except Exception:
+        return None
+    if not labels:
+        return None
+    label_map: Dict[int, Any] = {}
+    for label in labels:
+        try:
+            label_map[int(label)] = label
+        except Exception:
+            continue
+    if reference_label in label_map:
+        return int(reference_label)
+    if label_map:
+        return sorted(label_map.keys())[0]
+    return None
+
+
+def _resolve_signal_labels(calib: Any) -> List[int]:
+    hetero = _get_signal_hetero_model(calib)
+    if hetero is None:
+        return []
+    try:
+        labels = list(hetero.keys())
+    except Exception:
+        return []
+    label_ids: List[int] = []
+    for label in labels:
+        try:
+            label_ids.append(int(label))
+        except Exception:
+            continue
+    return sorted(set(label_ids))
+
+
+def _align_image_to_baseline(
+    calib: HeterogeneousColorToMassAnalysis,
+    img: Any,
+    fluidflower: Any = None,
+) -> Tuple[HeterogeneousColorToMassAnalysis, Any]:
+    """
+    Ensure calibration image and baseline have the same height/width by cropping
+    all involved arrays (baseline, image, labels mask) to a common overlapping area.
+    This prevents broadcast errors when shapes differ.
+    """
+    try:
+        base = getattr(calib, "baseline", None)
+        if base is None and fluidflower is not None:
+            base = getattr(fluidflower, "baseline", None)
+        base_arr = getattr(base, "img", base)
+        img_arr = getattr(img, "img", img)
+        labels_obj = getattr(calib, "labels", None)
+        if labels_obj is None and fluidflower is not None:
+            labels_obj = getattr(fluidflower, "labels", None)
+        label_arr = getattr(labels_obj, "img", None)
+        b_shape = np.shape(base_arr)
+        i_shape = np.shape(img_arr)
+        l_shape = np.shape(label_arr) if label_arr is not None else None
+        if len(b_shape) < 2 or len(i_shape) < 2:
+            return calib, img
+        shapes = [b_shape[:2], i_shape[:2]]
+        if l_shape is not None and len(l_shape) >= 2:
+            shapes.append(l_shape[:2])
+        new_h = min(s[0] for s in shapes)
+        new_w = min(s[1] for s in shapes)
+        base_crop = np.array(base_arr)[:new_h, :new_w, ...]
+        img_crop = np.array(img_arr)[:new_h, :new_w, ...]
+        # If labels exist, crop them too so masks align.
+        target_labels = labels_obj
+        if target_labels is None and hasattr(calib, "labels"):
+            target_labels = calib.labels
+        if target_labels is not None and hasattr(target_labels, "img"):
+            try:
+                target_labels.img = target_labels.img[:new_h, :new_w, ...]
+            except Exception:
+                pass
+        # Crop image porosity and geometry voxel shape if available on the rig.
+        if fluidflower is not None:
+            img_porosity = getattr(fluidflower, "image_porosity", None)
+            if img_porosity is not None and hasattr(img_porosity, "img"):
+                try:
+                    img_porosity.img = img_porosity.img[:new_h, :new_w, ...]
+                except Exception:
+                    pass
+            if hasattr(fluidflower, "geometry"):
+                try:
+                    fluidflower.geometry.num_voxels = (new_h, new_w)
+                except Exception:
+                    pass
+            # Crop any correction images if present.
+            corrections = getattr(fluidflower, "corrections", None)
+            if isinstance(corrections, (list, tuple)):
+                cropped_corr = []
+                for corr in corrections:
+                    if hasattr(corr, "img"):
+                        try:
+                            corr.img = corr.img[:new_h, :new_w, ...]  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    cropped_corr.append(corr)
+                try:
+                    fluidflower.corrections = cropped_corr
+                except Exception:
+                    pass
+        # Apply cropped baseline on this calibration copy (and propagate to rig/CO2 analysis if present).
+        base_img_obj = None
+        try:
+            base_img_obj = darsia.Image(base_crop)
+        except Exception:
+            base_img_obj = base_crop
+        if hasattr(base, "img"):
+            base.img = base_crop  # type: ignore[attr-defined]
+        try:
+            calib.baseline = base_img_obj  # type: ignore[assignment]
+        except Exception:
+            pass
+        if fluidflower is not None:
+            try:
+                fluidflower.baseline = base_img_obj
+            except Exception:
+                pass
+            if target_labels is not None:
+                try:
+                    fluidflower.labels = target_labels
+                except Exception:
+                    pass
+        if target_labels is not None:
+            try:
+                calib.labels = target_labels
+            except Exception:
+                pass
+        # Apply cropped image, preserving metadata like date when possible.
+        img_date = getattr(img, "date", None)
+        if hasattr(img, "img"):
+            try:
+                img.img = img_crop  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        else:
+            try:
+                img = darsia.Image(img_crop)
+            except Exception:
+                img = img_crop  # type: ignore[assignment]
+        if img_date is not None:
+            try:
+                img.date = img_date  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # Crop any corrections attached to the image itself.
+        if hasattr(img, "corrections"):
+            try:
+                corr_list = getattr(img, "corrections")
+                if isinstance(corr_list, (list, tuple)):
+                    new_corr = []
+                    for corr in corr_list:
+                        if hasattr(corr, "img"):
+                            try:
+                                corr.img = corr.img[:new_h, :new_w, ...]  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                        new_corr.append(corr)
+                    try:
+                        img.corrections = new_corr  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # Sync CO2 mass analysis baseline if present.
+        try:
+            if hasattr(calib, "co2_mass_analysis") and hasattr(calib.co2_mass_analysis, "baseline"):
+                if hasattr(calib.co2_mass_analysis.baseline, "img"):
+                    calib.co2_mass_analysis.baseline.img = base_crop  # type: ignore[attr-defined]
+                else:
+                    calib.co2_mass_analysis.baseline = base_img_obj  # type: ignore[assignment]
+            # Also crop any precomputed fields on co2_mass_analysis that carry images.
+            if hasattr(calib, "co2_mass_analysis"):
+                for field in ("density_gaseous_co2", "solubility_co2"):
+                    arr = getattr(calib.co2_mass_analysis, field, None)
+                    try:
+                        arr_img = getattr(arr, "img", arr)
+                        cropped = np.array(arr_img)[:new_h, :new_w, ...]
+                        if hasattr(arr, "img"):
+                            arr.img = cropped  # type: ignore[attr-defined]
+                        else:
+                            setattr(calib.co2_mass_analysis, field, cropped)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # Crop color_analysis internals if present.
+        try:
+            ca = getattr(calib, "color_analysis", None)
+            if ca is not None:
+                base_ca = getattr(ca, "base", None)
+                if base_ca is not None:
+                    try:
+                        base_ca_img = getattr(base_ca, "img", base_ca)
+                        cropped = np.array(base_ca_img)[:new_h, :new_w, ...]
+                        if hasattr(base_ca, "img"):
+                            base_ca.img = cropped  # type: ignore[attr-defined]
+                        else:
+                            ca.base = cropped  # type: ignore[assignment]
+                    except Exception:
+                        pass
+                mask_ca = getattr(ca, "mask", None)
+                if mask_ca is not None:
+                    try:
+                        mask_img = getattr(mask_ca, "img", mask_ca)
+                        cropped_mask = np.array(mask_img)[:new_h, :new_w, ...]
+                        if hasattr(mask_ca, "img"):
+                            mask_ca.img = cropped_mask  # type: ignore[attr-defined]
+                        else:
+                            ca.mask = cropped_mask  # type: ignore[assignment]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Shape alignment failed: %s", exc)
+    return calib, img
+
+
+def _build_geometry_if_missing(config: FluidFlowerConfig, fluidflower: Any) -> darsia.ExtrudedPorousGeometry:
+    """
+    Ensure the rig has geometry and image_porosity available, using rig artifacts
+    if present and otherwise synthesizing minimal placeholders.
+    """
+    rig_path = getattr(config.rig, "path", None)
+    if rig_path is None:
+        try:
+            rig_path = Path(config.data.results) / "setup" / "rig"
+        except Exception:
+            rig_path = None
+    rig_path = Path(rig_path) if rig_path else None
+
+    def _load_rig_image(name: str) -> Optional[darsia.Image]:
+        if rig_path is None:
+            return None
+        candidate = rig_path / f"{name}.npz"
+        if candidate.exists():
+            try:
+                return darsia.imread(candidate)
+            except Exception:
+                return None
+        return None
+    def _is_spatial(value: Any) -> bool:
+        try:
+            arr = getattr(value, "img", value)
+            arr = np.array(arr)
+            return arr.ndim >= 2 and arr.shape[0] > 1 and arr.shape[1] > 1
+        except Exception:
+            return False
+
+    baseline = getattr(fluidflower, "baseline", None)
+    if baseline is None:
+        baseline = _load_rig_image("baseline")
+        if baseline is not None:
+            fluidflower.baseline = baseline
+        if baseline is None:
+            baseline = darsia.Image(np.zeros((1, 1, 3), dtype=np.float32))
+            fluidflower.baseline = baseline
+
+    image_porosity = getattr(fluidflower, "image_porosity", None)
+    if not _is_spatial(image_porosity):
+        image_porosity = _load_rig_image("image_porosity")
+    if image_porosity is None:
+        try:
+            image_porosity = darsia.ones_like(baseline, dtype=np.float32)
+        except Exception:
+            image_porosity = darsia.Image(np.ones((1, 1), dtype=np.float32))
+    try:
+        fluidflower.image_porosity = image_porosity
+    except Exception:
+        pass
+
+    depth_val = getattr(fluidflower, "depth", None)
+    if not _is_spatial(depth_val):
+        depth_val = _load_rig_image("depth")
+    if depth_val is None or not _is_spatial(depth_val):
+        try:
+            depth_val = float(getattr(config, "depth", 1.0))
+        except Exception:
+            depth_val = 1.0
+    try:
+        fluidflower.depth = depth_val
+    except Exception:
+        pass
+
+    porosity_val = getattr(fluidflower, "porosity", None)
+    if not _is_spatial(porosity_val):
+        porosity_val = _load_rig_image("porosity")
+    if porosity_val is None or not _is_spatial(porosity_val):
+        porosity_val = image_porosity if image_porosity is not None else 1.0
+    try:
+        fluidflower.porosity = porosity_val
+    except Exception:
+        pass
+
+    def _shape2(value: Any) -> Optional[Tuple[int, int]]:
+        try:
+            arr = getattr(value, "img", value)
+            arr = np.array(arr)
+            if arr.ndim >= 2:
+                return tuple(arr.shape[:2])
+        except Exception:
+            return None
+        return None
+
+    num_voxels = (
+        _shape2(porosity_val)
+        or _shape2(depth_val)
+        or _shape2(image_porosity)
+        or _shape2(baseline)
+        or (1, 1)
+    )
+    try:
+        shape_meta = baseline.shape_metadata()
+        width = shape_meta.get("width", getattr(config.rig, "width", 1.0))
+        height = shape_meta.get("height", getattr(config.rig, "height", 1.0))
+    except Exception:
+        width = getattr(config.rig, "width", 1.0)
+        height = getattr(config.rig, "height", 1.0)
+
+    geometry = darsia.ExtrudedPorousGeometry(
+        porosity=porosity_val,
+        depth=depth_val,
+        space_dim=2,
+        num_voxels=num_voxels,
+        dimensions=[width, height],
+    )
+    try:
+        fluidflower.geometry = geometry
+    except Exception:
+        pass
+    return geometry
+
+
+# ---------------------------------------------------------------------------
+# Config/bounds helpers
+
+
+def load_bounds_map(path: Optional[Path]) -> Dict[str, Dict[str, Tuple[float, float]]]:
+    if not path:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(f"Bounds file not found: {path}")
+    data = json.loads(path.read_text())
+
+    def _is_bounds_pair(val: Any) -> bool:
+        return isinstance(val, (list, tuple)) and len(val) == 2
+
+    if isinstance(data, dict) and data and all(_is_bounds_pair(v) for v in data.values()):
+        data = {"default": data}
+
+    bounds_map: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    if not isinstance(data, dict):
+        return bounds_map
+    for key, val in data.items():
+        if isinstance(val, dict):
+            bounds_map[key] = {k: tuple(v) for k, v in val.items()}
+    return bounds_map
+
+
+def _match_bounds(
+    name: str,
+    override: Dict[str, Tuple[float, float]],
+    default_override: Dict[str, Tuple[float, float]],
+) -> Optional[Tuple[float, float]]:
+    if name in override:
+        return override[name]
+    if name in default_override:
+        return default_override[name]
+
+    def _match_pattern(
+        patterns: Dict[str, Tuple[float, float]]
+    ) -> Optional[Tuple[float, float]]:
+        wildcard_keys = [k for k in patterns if any(ch in k for ch in "*?[")]
+        for key in sorted(wildcard_keys, key=len, reverse=True):
+            if fnmatch.fnmatch(name, key):
+                return patterns[key]
+        return None
+
+    match = _match_pattern(override)
+    if match is not None:
+        return match
+    return _match_pattern(default_override)
+
+
+def build_param_space(
+    run: str,
+    bounds_map: Dict[str, Dict[str, Tuple[float, float]]],
+    signal_label: Optional[int] = None,
+    signal_labels: Optional[Sequence[int]] = None,
+    per_label_params: bool = False,
+    use_facies: bool = True,
+) -> List[Dict[str, Any]]:
+    base_space = copy.deepcopy(PARAM_SPACE_TEMPLATE)
+    if not use_facies:
+        base_space = _extend_signal_values(base_space, 8)
+    override = bounds_map.get(run, {})
+    default_override = bounds_map.get("default", {})
+
+    def _is_signal_path(path: Any) -> bool:
+        return (
+            isinstance(path, list)
+            and len(path) >= 6
+            and path[0] == "signal_model"
+            and path[1] == "model"
+            and path[2] == 1
+            and path[4] == "values"
+        )
+
+    if per_label_params:
+        labels = list(signal_labels or [])
+        if not labels and signal_label is not None:
+            labels = [signal_label]
+        signal_entries = [
+            entry for entry in base_space if _parse_signal_name(entry["name"])
+        ]
+        other_entries = [
+            entry for entry in base_space if not _parse_signal_name(entry["name"])
+        ]
+        space: List[Dict[str, Any]] = []
+        for label in labels:
+            for entry in signal_entries:
+                new_entry = copy.deepcopy(entry)
+                new_entry["name"] = entry["name"].replace(
+                    "signal.label0", f"signal.label{label}"
+                )
+                path = new_entry.get("attr_path")
+                if _is_signal_path(path):
+                    path[3] = int(label)
+                    new_entry["attr_path"] = path
+                space.append(new_entry)
+        space.extend(other_entries)
+    else:
+        space = base_space
+        if signal_label is not None:
+            for entry in space:
+                path = entry.get("attr_path")
+                if _is_signal_path(path):
+                    path[3] = int(signal_label)
+                    entry["attr_path"] = path
+
+    for entry in space:
+        name = entry["name"]
+        bounds = _match_bounds(name, override, default_override)
+        if bounds is not None:
+            entry["bounds"] = tuple(bounds)
+    return space
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+
+
+@dataclass
+class Metrics:
+    injected_full: float
+    total_full: float
+
+
+@dataclass
+class EvalResult:
+    objective: float
+    feasible: bool
+    metrics: Dict[str, Metrics]
+    status: str
+    params: Dict[str, Any]
+
+
+@dataclass
+class CalibrationContext:
+    run: str
+    config: FluidFlowerConfig
+    experiment: darsia.ProtocolledExperiment
+    fluidflower: Any  # ff_ac (darsia) Rig instance
+    geometry: darsia.ExtrudedPorousGeometry
+    calibration: HeterogeneousColorToMassAnalysis
+    calibration_images: List[Path]
+    reference_label: int
+    signal_label: Optional[int]
+    signal_labels: List[int]
+    param_space: List[Dict[str, Any]]
+    enforce_lower: bool
+    per_label_params: bool
+    use_facies: bool = False
+    use_label_weights: bool = False
+    label_weights: Dict[int, float] = field(default_factory=dict)
+    image_cache_dir: Optional[Path] = None
+    image_cache_control_path: Optional[Path] = None
+    quality_scale: float = 1.0
+    quality_dtype: Optional[str] = None
+    objective_integral: str = "off"
+
+
+# ---------------------------------------------------------------------------
+# Image caching helpers (per worker process)
+
+
+class _ImageLRU:
+    def __init__(self, max_size: int) -> None:
+        self.max_size = max_size
+        self._cache: "OrderedDict[str, Any]" = OrderedDict()
+
+    def set_max(self, max_size: int) -> None:
+        self.max_size = max(0, int(max_size))
+        self._evict()
+
+    def get(self, key: str) -> Optional[Any]:
+        if self.max_size <= 0:
+            return None
+        try:
+            value = self._cache.pop(key)
+        except KeyError:
+            return None
+        self._cache[key] = value
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        if self.max_size <= 0:
+            return
+        if key in self._cache:
+            self._cache.pop(key)
+        self._cache[key] = value
+        self._evict()
+
+    def _evict(self) -> None:
+        while self.max_size > 0 and len(self._cache) > self.max_size:
+            self._cache.popitem(last=False)
+
+
+_IMAGE_CACHE = _ImageLRU(DEFAULT_IMAGE_CACHE_SIZE)
+
+
+def _parse_cache_size(text: str) -> Optional[int]:
+    stripped = text.strip().lower()
+    if not stripped:
+        return None
+    if stripped in ("off", "none", "disabled"):
+        return 0
+    try:
+        return max(0, int(float(stripped)))
+    except Exception:
+        return None
+
+
+def _resolve_cache_size(context: CalibrationContext) -> int:
+    if context.image_cache_control_path is not None:
+        try:
+            raw = context.image_cache_control_path.read_text(encoding="utf-8")
+            parsed = _parse_cache_size(raw)
+            if parsed is not None:
+                return parsed
+        except Exception:
+            pass
+    return DEFAULT_IMAGE_CACHE_SIZE
+
+
+def _resolve_cache_control_path() -> Optional[Path]:
+    control_dir = os.getenv("AUTO_CALIB_CACHE_CONTROL_DIR")
+    if not control_dir:
+        return None
+    base = Path(control_dir)
+    if not base.exists():
+        return None
+    host = socket.gethostname()
+    host_path = base / f"{host}.image_cache.txt"
+    if host_path.exists():
+        return host_path
+    default_path = base / "image_cache_size.txt"
+    if default_path.exists():
+        return default_path
+    return host_path
+
+
+def _normalize_quality_dtype(value: Optional[str]) -> Optional[np.dtype]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("float32", "f32", "32"):
+        return np.float32
+    if text in ("float64", "f64", "64"):
+        return np.float64
+    return None
+
+
+def _normalize_objective_integral(value: Optional[str]) -> str:
+    if value is None:
+        return "off"
+    raw = str(value).strip().lower()
+    if raw in ("off", "none", "disabled", "false", "0"):
+        return "off"
+    if raw in ("l1", "abs", "absolute"):
+        return "l1"
+    if raw in ("l2", "square", "squared"):
+        return "l2"
+    return "off"
+
+
+def _maybe_cast_float_image(img: Any, dtype: Optional[np.dtype]) -> Any:
+    if dtype is None:
+        return img
+    arr = getattr(img, "img", None)
+    if arr is None or not np.issubdtype(arr.dtype, np.floating):
+        return img
+    try:
+        return img.img_as(dtype)
+    except Exception:
+        try:
+            clone = img.copy()
+            clone.img = clone.img.astype(dtype)
+            return clone
+        except Exception:
+            return img
+
+
+def _resize_image(
+    img: Any,
+    scale: float,
+    interpolation: Optional[str] = None,
+    dtype: Optional[np.dtype] = None,
+) -> Any:
+    if scale == 1.0:
+        return _maybe_cast_float_image(img, dtype)
+    try:
+        resized = darsia.resize(img, fx=scale, fy=scale, interpolation=interpolation)
+    except Exception:
+        return _maybe_cast_float_image(img, dtype)
+    return _maybe_cast_float_image(resized, dtype)
+
+
+def _resize_array_like(
+    value: Any,
+    scale: float,
+    interpolation: Optional[str] = None,
+    dtype: Optional[np.dtype] = None,
+) -> Any:
+    if value is None:
+        return None
+    if scale == 1.0:
+        return value
+    try:
+        resized = darsia.resize(value, fx=scale, fy=scale, interpolation=interpolation)
+    except Exception:
+        return value
+    if dtype is None:
+        return resized
+    try:
+        return np.array(resized, dtype=dtype)
+    except Exception:
+        return resized
+
+
+def _scale_geometry(
+    geometry: Any,
+    scale: float,
+    ref_image: Any,
+    dtype: Optional[np.dtype],
+) -> Any:
+    if geometry is None or scale == 1.0:
+        return geometry
+    try:
+        porosity = getattr(geometry, "porosity", None)
+        depth = getattr(geometry, "depth", None)
+        if porosity is None or depth is None:
+            return geometry
+        porosity_scaled = _resize_array_like(porosity, scale, interpolation="inter_area", dtype=dtype)
+        depth_scaled = _resize_array_like(depth, scale, interpolation="inter_area", dtype=dtype)
+        ref_shape = np.shape(getattr(ref_image, "img", ref_image))[:2]
+        dimensions = getattr(geometry, "dimensions", None)
+        if not dimensions and hasattr(ref_image, "dimensions"):
+            dimensions = list(getattr(ref_image, "dimensions", []))
+        if not dimensions:
+            dimensions = [1.0, 1.0]
+        return darsia.ExtrudedPorousGeometry(
+            porosity=porosity_scaled,
+            depth=depth_scaled,
+            space_dim=2,
+            num_voxels=ref_shape,
+            dimensions=list(dimensions),
+        )
+    except Exception:
+        return geometry
+
+
+def _apply_quality_to_rig(
+    fluidflower: Any,
+    geometry: Any,
+    scale: float,
+    dtype: Optional[np.dtype],
+    use_facies: bool,
+) -> Any:
+    if scale == 1.0 and dtype is None:
+        return geometry
+    if getattr(fluidflower, "baseline", None) is not None:
+        fluidflower.baseline = _resize_image(
+            fluidflower.baseline,
+            scale,
+            interpolation="inter_area",
+            dtype=dtype,
+        )
+    if getattr(fluidflower, "labels", None) is not None:
+        fluidflower.labels = _resize_image(
+            fluidflower.labels,
+            scale,
+            interpolation="inter_nearest",
+            dtype=None,
+        )
+    if use_facies and getattr(fluidflower, "facies", None) is not None:
+        fluidflower.facies = _resize_image(
+            fluidflower.facies,
+            scale,
+            interpolation="inter_nearest",
+            dtype=None,
+        )
+    if getattr(fluidflower, "image_porosity", None) is not None:
+        fluidflower.image_porosity = _resize_image(
+            fluidflower.image_porosity,
+            scale,
+            interpolation="inter_area",
+            dtype=dtype,
+        )
+    geometry = _scale_geometry(geometry, scale, fluidflower.baseline, dtype)
+    if geometry is not None:
+        try:
+            fluidflower.geometry = geometry
+        except Exception:
+            pass
+    return geometry
+
+
+def _quality_key(scale: float, dtype: Optional[str]) -> str:
+    dtype_tag = dtype or "native"
+    return f"s={scale:g}|dtype={dtype_tag}"
+
+
+def _load_calibration_image(context: CalibrationContext, img_path: Path) -> Any:
+    scale = float(getattr(context, "quality_scale", 1.0) or 1.0)
+    dtype_tag = getattr(context, "quality_dtype", None)
+    dtype = _normalize_quality_dtype(dtype_tag)
+    key = f"{img_path}|{_quality_key(scale, dtype_tag)}"
+    cached = _IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cache_dir = context.image_cache_dir
+    cache_path = None
+    if cache_dir is not None:
+        safe_key = _quality_key(scale, dtype_tag).replace("|", "_").replace("=", "")
+        cache_path = cache_dir / f"cache_{img_path.stem}_{safe_key}.npz"
+    img = None
+    if cache_path is not None and cache_path.exists():
+        try:
+            img = darsia.imread(cache_path)
+        except Exception:
+            img = None
+    if img is None:
+        img = context.fluidflower.read_image(img_path)
+        if cache_path is not None:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                img.save(cache_path)
+            except Exception:
+                pass
+    img = _resize_image(img, scale, interpolation="inter_area", dtype=dtype)
+    _IMAGE_CACHE.set(key, img)
+    return img
+
+
+def compute_auto_label_weights(context: CalibrationContext) -> Dict[int, float]:
+    labels_obj = getattr(context.fluidflower, "labels", None)
+    labels_arr = np.array(getattr(labels_obj, "img", labels_obj))
+    if labels_arr.ndim < 2:
+        return {}
+    label_ids = list(context.signal_labels or [])
+    if not label_ids:
+        label_ids = [int(x) for x in np.unique(labels_arr)]
+    ignore_labels = set(getattr(context.config.color_paths, "ignore_labels", []) or [])
+    label_ids = [label for label in label_ids if label not in ignore_labels and label != 0]
+    if not label_ids:
+        return {}
+
+    baseline_obj = getattr(context.fluidflower, "baseline", None)
+    baseline_arr = np.array(getattr(baseline_obj, "img", baseline_obj))
+    if baseline_arr.ndim < 2:
+        return {}
+
+    label_series: Dict[int, List[float]] = {label: [] for label in label_ids}
+    for img_path in context.calibration_images:
+        img = _load_calibration_image(context, img_path)
+        _, img = _align_image_to_baseline(context.calibration, img, context.fluidflower)
+        img_arr = np.array(getattr(img, "img", img))
+        baseline_obj = getattr(context.fluidflower, "baseline", None)
+        baseline_arr = np.array(getattr(baseline_obj, "img", baseline_obj))
+        labels_arr = np.array(getattr(context.fluidflower.labels, "img", context.fluidflower.labels))
+        if img_arr.shape[:2] != baseline_arr.shape[:2]:
+            h = min(img_arr.shape[0], baseline_arr.shape[0])
+            w = min(img_arr.shape[1], baseline_arr.shape[1])
+            img_arr = img_arr[:h, :w, ...]
+            baseline_arr = baseline_arr[:h, :w, ...]
+            labels_arr = labels_arr[:h, :w]
+        diff = img_arr.astype(np.float32) - baseline_arr.astype(np.float32)
+        if diff.ndim >= 3:
+            diff_mag = np.mean(np.abs(diff), axis=2)
+        else:
+            diff_mag = np.abs(diff)
+        for label in label_ids:
+            mask = labels_arr == label
+            if not np.any(mask):
+                continue
+            label_series[label].append(float(diff_mag[mask].mean()))
+
+    changes: Dict[int, float] = {}
+    for label, values in label_series.items():
+        if values:
+            changes[label] = float(np.std(values))
+    if not changes:
+        return {}
+    mean_change = float(np.mean(list(changes.values())))
+    if mean_change <= 0:
+        return {}
+    weights = {label: change / mean_change for label, change in changes.items()}
+    logger.info("Auto label weights for %s: %s", context.run, weights)
+    return weights
+
+
+def apply_label_weight_grouping(
+    weights: Dict[int, float],
+    context: CalibrationContext,
+    grouping: Optional[str],
+) -> Dict[int, float]:
+    if not weights:
+        return weights
+    if not grouping or grouping == "none":
+        return weights
+    if grouping != "facies":
+        return weights
+    if getattr(context, "use_facies", False):
+        return weights
+    facies_obj = getattr(context.fluidflower, "facies", None)
+    if facies_obj is None:
+        return weights
+    labels_obj = getattr(context.fluidflower, "labels", None)
+    if labels_obj is None:
+        return weights
+
+    labels_arr = np.array(getattr(labels_obj, "img", labels_obj))
+    facies_arr = np.array(getattr(facies_obj, "img", facies_obj))
+    if labels_arr.ndim < 2 or facies_arr.ndim < 2:
+        return weights
+    if labels_arr.shape[:2] != facies_arr.shape[:2]:
+        h = min(labels_arr.shape[0], facies_arr.shape[0])
+        w = min(labels_arr.shape[1], facies_arr.shape[1])
+        labels_arr = labels_arr[:h, :w]
+        facies_arr = facies_arr[:h, :w]
+
+    label_to_group: Dict[int, int] = {}
+    for label in np.unique(labels_arr):
+        try:
+            label_int = int(label)
+        except Exception:
+            continue
+        if label_int == 0:
+            continue
+        mask = labels_arr == label_int
+        if not np.any(mask):
+            continue
+        group_vals = facies_arr[mask]
+        if group_vals.size == 0:
+            continue
+        vals, counts = np.unique(group_vals, return_counts=True)
+        group_id = int(vals[int(np.argmax(counts))])
+        label_to_group[label_int] = group_id
+
+    group_sums: Dict[int, float] = {}
+    for label, weight in weights.items():
+        group = label_to_group.get(int(label))
+        if group is None:
+            continue
+        group_sums[group] = group_sums.get(group, 0.0) + float(weight)
+    if not group_sums:
+        return weights
+
+    total_weight = float(sum(float(w) for w in weights.values()))
+    target = total_weight / float(len(group_sums))
+    normalized: Dict[int, float] = {}
+    for label, weight in weights.items():
+        group = label_to_group.get(int(label))
+        if group is None:
+            normalized[label] = float(weight)
+            continue
+        group_sum = group_sums.get(group, 0.0)
+        if group_sum <= 0:
+            normalized[label] = float(weight)
+        else:
+            normalized[label] = float(weight) * (target / group_sum)
+    logger.info("Applied label weight grouping '%s' for %s", grouping, context.run)
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Calibration building
+
+
+def build_context(
+    run: str,
+    config_dir: Path,
+    rig_cls,
+    ref_config_path: Optional[Path],
+    use_facies: bool,
+    bounds_map: Dict[str, Dict[str, Tuple[float, float]]],
+    enforce_lower: bool,
+    per_label_params: bool = False,
+    use_label_weights: bool = False,
+    label_weights: Optional[Dict[int, float]] = None,
+    quality_scale: float = 1.0,
+    quality_dtype: Optional[str] = None,
+    objective_integral: str = "off",
+) -> CalibrationContext:
+    config_path = config_dir / f"{run}.toml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    # ff_ac: merge shared common.toml (one level above config_dir) with the run file.
+    common_path = config_dir.parent / "common.toml"
+    config_files = [common_path, config_path] if common_path.exists() else [config_path]
+    config = FluidFlowerConfig(config_files, require_data=True, require_results=False)
+    try:
+        config.check("color_paths", "rig", "data", "protocol", "color_to_mass")
+    except Exception as exc:
+        logger.warning("Config check skipped due to: %s", exc)
+
+    experiment = darsia.ProtocolledExperiment(
+        data=config.data.data,
+        imaging_protocol=config.protocol.imaging,
+        injection_protocol=config.protocol.injection,
+        pressure_temperature_protocol=config.protocol.pressure_temperature,
+        blacklist_protocol=config.protocol.blacklist,
+        pad=config.data.pad,
+    )
+
+    rig_path = getattr(config.rig, "path", None)
+    if rig_path is None:
+        try:
+            # Default to results/setup/rig next to the analysis results if rig.path missing.
+            rig_path = Path(config.data.results) / "setup" / "rig"
+        except Exception:
+            rig_path = None
+    if rig_path is None or not Path(rig_path).exists():
+        raise FileNotFoundError(f"Rig path not found (config.rig.path missing and fallback unavailable): {rig_path}")
+    rig_path = Path(rig_path)
+    try:
+        # Prefer classmethod load (returns fully initialized rig with facies/geometry).
+        fluidflower = rig_cls.load(rig_path)
+    except Exception:
+        fluidflower = rig_cls()
+        fluidflower.load(rig_path)
+    fluidflower.load_experiment(experiment)
+    # Ensure corrections attribute exists; some rigs may not expose it.
+    if not hasattr(fluidflower, "corrections"):
+        fluidflower.corrections = []
+    # Refresh baseline via read_image only if it matches label shape; otherwise keep rig baseline.
+    try:
+        baseline_path = Path(config.data.folder) / config.data.baseline
+        if baseline_path.exists():
+            candidate = fluidflower.read_image(baseline_path)
+            candidate_img = getattr(candidate, "img", candidate)
+            labels = getattr(fluidflower, "labels", None)
+            labels_img = getattr(labels, "img", None)
+            if labels_img is None or np.shape(candidate_img)[:2] == np.shape(labels_img)[:2]:
+                fluidflower.baseline = candidate
+            else:
+                logger.warning(
+                    "Skipping read_image baseline: shape %s != labels shape %s",
+                    np.shape(candidate_img),
+                    np.shape(labels_img),
+                )
+    except Exception:
+        pass
+    # Ensure geometry/image_porosity exist on the rig (newer DARSiA may omit or attach scalars).
+    geometry = getattr(fluidflower, "geometry", None)
+    def _has_spatial(val: Any) -> bool:
+        try:
+            arr = getattr(val, "img", val)
+            arr = np.array(arr)
+            return arr.ndim >= 2
+        except Exception:
+            return False
+    needs_geometry = geometry is None
+    if geometry is not None:
+        if not _has_spatial(getattr(geometry, "depth", None)):
+            needs_geometry = True
+        if not _has_spatial(getattr(geometry, "porosity", None)):
+            needs_geometry = True
+    if needs_geometry:
+        _build_geometry_if_missing(config, fluidflower)
+    if use_facies:
+        fluidflower.labels = fluidflower.facies.copy()
+    reference_label = config.color_paths.reference_label
+    dtype = _normalize_quality_dtype(quality_dtype)
+    geometry = _apply_quality_to_rig(fluidflower, getattr(fluidflower, "geometry", None), quality_scale, dtype, use_facies)
+
+    calibration_images = _find_calibration_images(config, experiment, fluidflower)
+    calibration = _load_or_create_calibration(
+        config,
+        fluidflower,
+        experiment,
+        ref_config_path=ref_config_path,
+        use_facies=use_facies,
+    )
+    signal_label = _resolve_signal_label(calibration, reference_label)
+    signal_labels = _resolve_signal_labels(calibration)
+    param_space = build_param_space(
+        run,
+        bounds_map,
+        signal_label=signal_label,
+        signal_labels=signal_labels,
+        per_label_params=per_label_params,
+        use_facies=use_facies,
+    )
+    cache_dir = None
+    cache_control_path = _resolve_cache_control_path()
+    try:
+        cache_dir = Path(config.data.results) / "tmp"
+    except Exception:
+        pass
+    normalized_weights: Dict[int, float] = {}
+    if label_weights:
+        for key, weight in label_weights.items():
+            try:
+                label = int(key)
+            except Exception:
+                continue
+            try:
+                normalized_weights[label] = float(weight)
+            except Exception:
+                continue
+
+    return CalibrationContext(
+        run=run,
+        config=config,
+        experiment=experiment,
+        fluidflower=fluidflower,
+        geometry=getattr(fluidflower, "geometry", None),
+        calibration=calibration,
+        calibration_images=calibration_images,
+        reference_label=reference_label,
+        signal_label=signal_label,
+        signal_labels=signal_labels,
+        param_space=param_space,
+        enforce_lower=enforce_lower,
+        per_label_params=per_label_params,
+        use_facies=use_facies,
+        use_label_weights=use_label_weights,
+        label_weights=normalized_weights,
+        image_cache_dir=cache_dir,
+        image_cache_control_path=cache_control_path,
+        quality_scale=quality_scale,
+        quality_dtype=quality_dtype,
+        objective_integral=_normalize_objective_integral(objective_integral),
+    )
+
+
+def _find_calibration_images(
+    config: FluidFlowerConfig,
+    experiment: darsia.ProtocolledExperiment,
+    fluidflower: Any,
+) -> List[Path]:
+    calibration_image_paths = config.color_to_mass.calibration_image_paths
+    if len(calibration_image_paths) == 0:
+        calibration_image_paths = experiment.find_images_for_times(
+            times=config.color_to_mass.calibration_image_times
+        )
+    return [p if p.is_absolute() else (config.data.folder / p) for p in calibration_image_paths]
+
+
+def _load_or_create_calibration(
+    config: FluidFlowerConfig,
+    fluidflower: Any,
+    experiment: darsia.ProtocolledExperiment,
+    ref_config_path: Optional[Path],
+    use_facies: bool,
+) -> HeterogeneousColorToMassAnalysis:
+    folder = config.color_to_mass.calibration_folder
+    if folder.exists():
+        metadata_path = folder / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Calibration folder {folder} missing metadata.json; "
+                "cannot load. Fix the folder or delete it to re-init."
+            )
+        _ensure_label_files_from_labels(folder, fluidflower)
+        last_exc = None
+        for _ in range(10):
+            try:
+                return _load_calibration_from_folder(config, fluidflower, experiment)
+            except FileNotFoundError as exc:
+                last_exc = exc
+                if _maybe_fill_missing_label_file(folder, exc):
+                    continue
+                raise FileNotFoundError(
+                    f"Calibration folder {folder} failed to load; "
+                    "fix the folder or delete it to re-init."
+                ) from exc
+        raise FileNotFoundError(
+            f"Calibration folder {folder} failed to load; "
+            f"fix the folder or delete it to re-init. Last error: {last_exc}"
+        )
+
+    if ref_config_path:
+        ref_config = FluidFlowerConfig(ref_config_path, require_data=False, require_results=False)
+        ref_folder = ref_config.color_to_mass.calibration_folder
+        if ref_folder.exists():
+            metadata_path = ref_folder / "metadata.json"
+            if not metadata_path.exists():
+                raise FileNotFoundError(
+                    f"Reference calibration folder {ref_folder} missing metadata.json; "
+                    "cannot load."
+                )
+            _ensure_label_files_from_labels(ref_folder, fluidflower)
+            last_exc = None
+            for _ in range(10):
+                try:
+                    return _load_calibration_from_folder(ref_config, fluidflower, experiment)
+                except FileNotFoundError as exc:
+                    last_exc = exc
+                    if _maybe_fill_missing_label_file(ref_folder, exc):
+                        continue
+                    raise FileNotFoundError(
+                        f"Reference calibration folder {ref_folder} failed to load."
+                    ) from exc
+            raise FileNotFoundError(
+                f"Reference calibration folder {ref_folder} failed to load. Last error: {last_exc}"
+            )
+
+    return _create_calibration_from_scratch(config, fluidflower, experiment, use_facies)
+
+
+def _load_calibration_from_folder(
+    config: FluidFlowerConfig,
+    fluidflower: Any,
+    experiment: darsia.ProtocolledExperiment,
+) -> HeterogeneousColorToMassAnalysis:
+    ignore_labels = []
+    metadata_path = config.color_to_mass.calibration_folder / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            ignore_labels = metadata.get("ignore_labels", []) or []
+        except Exception:
+            ignore_labels = []
+
+    baseline = getattr(fluidflower, "baseline", None)
+    if baseline is None:
+        rig_path = getattr(config.rig, "path", None)
+        candidate = Path(rig_path) / "baseline.npz" if rig_path else None
+        if candidate and candidate.exists():
+            try:
+                baseline = darsia.imread(candidate)
+            except Exception:
+                baseline = None
+    if baseline is None and getattr(fluidflower, "labels", None) is not None:
+        try:
+            baseline = darsia.zeros_like(fluidflower.labels)
+        except Exception:
+            baseline = None
+    if baseline is None:
+        baseline = darsia.Image(np.zeros((1, 1, 3), dtype=np.float32))
+
+    labels = getattr(fluidflower, "labels", None)
+    if labels is None:
+        rig_path = getattr(config.rig, "path", None)
+        candidate = Path(rig_path) / "labels.npz" if rig_path else None
+        if candidate and candidate.exists():
+            try:
+                labels = darsia.imread(candidate)
+            except Exception:
+                labels = None
+    if labels is None:
+        try:
+            labels = darsia.ones_like(baseline, dtype=np.uint8)
+        except Exception:
+            labels = darsia.Image(np.ones((1, 1), dtype=np.uint8))
+    if ignore_labels:
+        try:
+            labels_img = getattr(labels, "img", labels)
+            labels_img = np.array(labels_img)
+            labels_img = labels_img.copy()
+            for label in ignore_labels:
+                labels_img[labels_img == label] = 0
+            if hasattr(labels, "img"):
+                labels.img = labels_img
+            else:
+                labels = darsia.Image(labels_img)
+        except Exception:
+            pass
+
+    geometry = getattr(fluidflower, "geometry", None)
+    make_geometry = (
+        geometry is None
+        or not hasattr(geometry, "depth")
+        or (hasattr(geometry, "depth") and not hasattr(geometry.depth, "copy"))
+    )
+    if make_geometry:
+        depth_val = 1.0
+        try:
+            depth_val = float(getattr(config, "depth", 1.0))  # may not exist
+        except Exception:
+            depth_val = 1.0
+        image_porosity = getattr(fluidflower, "image_porosity", None)
+        porosity_val = 1.0
+        try:
+            porosity_val = float(np.mean(image_porosity.img)) if image_porosity is not None else 1.0
+        except Exception:
+            porosity_val = 1.0
+        depth_arr = np.array(depth_val, dtype=float)
+        porosity_arr = np.array(porosity_val, dtype=float)
+        try:
+            shape_meta = baseline.shape_metadata()
+            geometry = darsia.ExtrudedPorousGeometry(
+                porosity=porosity_arr,
+                depth=depth_arr,
+                space_dim=2,
+                num_voxels=shape_meta["shape"],
+                dimensions=[shape_meta.get("width", 1.0), shape_meta.get("height", 1.0)],
+            )
+        except Exception:
+            geometry = darsia.ExtrudedPorousGeometry(
+                porosity=porosity_arr, depth=depth_arr, space_dim=2, num_voxels=(1, 1), dimensions=[1.0, 1.0]
+            )
+    else:
+        # Ensure depth/porosity are array-like so downstream .copy() calls succeed.
+        if hasattr(geometry, "depth") and not hasattr(geometry.depth, "copy"):
+            try:
+                geometry.depth = np.array(geometry.depth, dtype=float)
+            except Exception:
+                pass
+
+    image_porosity = getattr(fluidflower, "image_porosity", None)
+    if image_porosity is None:
+        rig_path = getattr(config.rig, "path", None)
+        candidate = Path(rig_path) / "image_porosity.npz" if rig_path else None
+        if candidate and candidate.exists():
+            try:
+                image_porosity = darsia.imread(candidate)
+            except Exception:
+                image_porosity = None
+    if image_porosity is None:
+        # Last resort: synthesize a uniform porosity mask to keep workflows running.
+        if getattr(fluidflower, "baseline", None) is not None:
+            try:
+                image_porosity = darsia.ones_like(fluidflower.baseline, dtype=np.float32)
+            except Exception:
+                image_porosity = None
+        if image_porosity is None and getattr(fluidflower, "labels", None) is not None:
+            try:
+                image_porosity = darsia.ones_like(fluidflower.labels, dtype=np.float32)
+            except Exception:
+                image_porosity = None
+        if image_porosity is None:
+            image_porosity = darsia.Image(np.ones((1, 1), dtype=np.float32))
+    restoration = darsia.VolumeAveraging(
+        rev=darsia.REV(size=0.005, img=baseline),
+        mask=image_porosity,
+    )
+    experiment_start = experiment.experiment_start
+    state = experiment.pressure_temperature_protocol.get_state(experiment_start)
+    gradient = experiment.pressure_temperature_protocol.get_gradient(experiment_start)
+    co2_mass_analysis = darsia.CO2MassAnalysis(
+        baseline=baseline,
+        atmospheric_pressure=state.pressure,
+        atmospheric_temperature=state.temperature,
+        atmospheric_pressure_gradient=gradient.pressure,
+        atmospheric_temperature_gradient=gradient.temperature,
+    )
+    return HeterogeneousColorToMassAnalysis.load(
+        folder=config.color_to_mass.calibration_folder,
+        baseline=baseline,
+        labels=labels,
+        co2_mass_analysis=co2_mass_analysis,
+        geometry=geometry,
+        restoration=restoration,
+    )
+
+
+def _maybe_fill_missing_label0(folder: Path, exc: FileNotFoundError) -> bool:
+    return _maybe_fill_missing_label_file(folder, exc, allow_any_label=False)
+
+
+def _maybe_fill_missing_label_file(
+    folder: Path,
+    exc: FileNotFoundError,
+    allow_any_label: bool = True,
+) -> bool:
+    missing = getattr(exc, "filename", None)
+    if not missing:
+        return False
+    missing_path = Path(missing)
+    name = missing_path.name
+    patterns = [
+        ("color_path_interpretation_", ".json", folder / "color_path_interpretation"),
+        ("signal_model_", ".csv", folder / "signal_model"),
+    ]
+    for prefix, suffix, base_dir in patterns:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        if not allow_any_label and name != f"{prefix}0{suffix}":
+            return False
+        if not base_dir.exists():
+            return False
+        target_path = base_dir / name
+        if target_path.exists():
+            return False
+        candidates = sorted(base_dir.glob(f"{prefix}*{suffix}"))
+        candidates = [p for p in candidates if p.name != name]
+        if not candidates:
+            return False
+        try:
+            import shutil
+
+            shutil.copyfile(candidates[0], target_path)
+            logger.warning(
+                "Filled missing %s in %s using %s. Placeholder used for loading.",
+                name,
+                base_dir,
+                candidates[0].name,
+            )
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _ensure_label_files_from_labels(folder: Path, fluidflower: Any) -> None:
+    labels = getattr(fluidflower, "labels", None)
+    if labels is None:
+        return
+    try:
+        labels_img = getattr(labels, "img", labels)
+        unique_labels = np.unique(np.array(labels_img))
+    except Exception:
+        return
+
+    ignore_labels = []
+    metadata_path = folder / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            ignore_labels = metadata.get("ignore_labels", []) or []
+        except Exception:
+            ignore_labels = []
+
+    def _ensure_files(base_dir: Path, prefix: str, suffix: str) -> None:
+        if not base_dir.exists():
+            return
+        candidates = sorted(base_dir.glob(f"{prefix}*{suffix}"))
+        if not candidates:
+            return
+        for label in unique_labels:
+            try:
+                label_int = int(label)
+            except Exception:
+                continue
+            if label_int < 0 or label_int in ignore_labels:
+                continue
+            target = base_dir / f"{prefix}{label_int}{suffix}"
+            if target.exists():
+                continue
+            try:
+                import shutil
+
+                shutil.copyfile(candidates[0], target)
+                logger.warning(
+                    "Filled missing %s using %s for label %s.",
+                    target.name,
+                    candidates[0].name,
+                    label_int,
+                )
+            except Exception:
+                continue
+
+    _ensure_files(folder / "color_path_interpretation", "color_path_interpretation_", ".json")
+    _ensure_files(folder / "signal_model", "signal_model_", ".csv")
+
+
+def _create_calibration_from_scratch(
+    config: FluidFlowerConfig,
+    fluidflower: Any,
+    experiment: darsia.ProtocolledExperiment,
+    use_facies: bool,
+) -> HeterogeneousColorToMassAnalysis:
+    # Ensure baseline present
+    if getattr(fluidflower, "baseline", None) is None:
+        rig_path = getattr(config.rig, "path", None)
+        candidate = Path(rig_path) / "baseline.npz" if rig_path else None
+        if candidate and candidate.exists():
+            try:
+                fluidflower.baseline = darsia.imread(candidate)
+            except Exception:
+                pass
+        if getattr(fluidflower, "baseline", None) is None:
+            fluidflower.baseline = darsia.Image(np.zeros((1, 1, 3), dtype=np.float32))
+
+    # Ensure labels present
+    if getattr(fluidflower, "labels", None) is None:
+        rig_path = getattr(config.rig, "path", None)
+        candidate = Path(rig_path) / "labels.npz" if rig_path else None
+        if candidate and candidate.exists():
+            try:
+                fluidflower.labels = darsia.imread(candidate)
+            except Exception:
+                pass
+    if getattr(fluidflower, "labels", None) is None:
+        try:
+            fluidflower.labels = darsia.ones_like(fluidflower.baseline, dtype=np.uint8)
+        except Exception:
+            fluidflower.labels = darsia.Image(np.ones((1, 1), dtype=np.uint8))
+
+    if use_facies:
+        facies = getattr(fluidflower, "facies", None)
+        if facies is not None:
+            fluidflower.labels = facies.copy()
+        else:
+            logger.warning("use_facies requested but facies missing; falling back to labels.")
+        _color_paths = darsia.LabelColorPathMap.load(config.color_paths.calibration_file)
+        color_paths = darsia.LabelColorPathMap.refine(
+            _color_paths,
+            num_segments=6,
+            mode="relative",
+        )
+    else:
+        _color_paths = darsia.LabelColorPathMap.load(config.color_paths.calibration_file)
+        color_paths = darsia.LabelColorPathMap.refine(_color_paths, num_segments=8)
+
+    available_labels = list(color_paths.keys())
+    reference_label = config.color_paths.reference_label
+    if reference_label not in available_labels and available_labels:
+        logger.warning(
+            "Reference label %s not in color paths; using %s instead.",
+            reference_label,
+            available_labels[0],
+        )
+        reference_label = available_labels[0]
+
+    baseline_color_spectrum = darsia.LabelColorSpectrumMap.load(
+        config.color_paths.baseline_color_spectrum_folder
+    )
+
+    color_path_interpolation = {
+        label: darsia.ColorPathInterpolation(
+            color_path=color_path,
+            color_mode=darsia.ColorMode.RELATIVE,
+            values=color_path.relative_distances,
+            ignore_spectrum=baseline_color_spectrum[label],
+        )
+        for label, color_path in color_paths.items()
+        if label in baseline_color_spectrum
+    }
+
+    threshold = 0.2
+    distances = {
+        label: max(
+            [
+                float(baseline_color_spectrum[label].distance(c))
+                for c in color_path.colors
+            ]
+        )
+        for label, color_path in color_paths.items()
+        if label in baseline_color_spectrum
+    }
+    if not distances:
+        raise RuntimeError("No distances computed; baseline spectrum may be incomplete.")
+    if reference_label not in distances:
+        reference_label = next(iter(distances.keys()))
+        logger.warning("Switching reference label to %s due to missing distances.", reference_label)
+    reference_distance = max(distances.values())
+    reference_interpolation = color_path_interpolation[reference_label]
+    interpolation_values = {
+        label: max(
+            [
+                max(0.0, float(reference_interpolation(c)))
+                for c in color_path.relative_colors
+            ]
+        )
+        for label, color_path in color_paths.items()
+        if label in baseline_color_spectrum
+    }
+    if not interpolation_values:
+        raise RuntimeError("No interpolation values computed; baseline spectrum may be incomplete.")
+    if reference_label not in interpolation_values:
+        reference_label = next(iter(interpolation_values.keys()))
+        logger.warning("Switching reference label to %s due to missing interpolation.", reference_label)
+    reference_interpolation_value = max(interpolation_values.values())
+    ignore_labels = []
+    for label in np.unique(fluidflower.labels.img):
+        if label not in distances or label not in interpolation_values:
+            continue
+        relative_distance = distances[label] / reference_distance
+        relative_max_interpolation = interpolation_values[label] / reference_interpolation_value
+        if min(relative_distance, relative_max_interpolation) < threshold:
+            ignore_labels.append(label)
+
+    for label in color_path_interpolation:
+        color_path_interpolation[label].values *= interpolation_values[label]
+    for label in np.unique(fluidflower.labels.img):
+        if label in config.color_paths.ignore_labels or label in ignore_labels:
+            color_path_interpolation[label] = color_path_interpolation[reference_label]
+
+    color_path_interpretation = {
+        label: darsia.ColorPathInterpolation(
+            color_path=color_path,
+            color_mode=darsia.ColorMode.RELATIVE,
+            values=color_path.equidistant_distances,
+            ignore_spectrum=baseline_color_spectrum[label],
+        )
+        for label, color_path in color_paths.items()
+        if label in baseline_color_spectrum
+    }
+    ref_interp = color_path_interpretation.get(
+        reference_label, next(iter(color_path_interpretation.values()))
+    )
+    for label in np.unique(fluidflower.labels.img):
+        if label not in color_path_interpretation:
+            color_path_interpretation[label] = ref_interp
+
+    signal_functions = {
+        label: darsia.PWTransformation(
+            color_paths[label].equidistant_distances,
+            color_path_interpretation[label].values,
+        )
+        for label in color_path_interpretation
+        if label in color_paths
+    }
+    ref_signal = signal_functions.get(
+        reference_label, next(iter(signal_functions.values()))
+    )
+    for label in np.unique(fluidflower.labels.img):
+        if label not in signal_functions:
+            signal_functions[label] = ref_signal
+
+    image_porosity = getattr(fluidflower, "image_porosity", None)
+    if image_porosity is None and getattr(fluidflower, "baseline", None) is not None:
+        try:
+            image_porosity = darsia.ones_like(fluidflower.baseline, dtype=np.float32)
+        except Exception:
+            image_porosity = None
+
+    geometry = getattr(fluidflower, "geometry", None)
+    if geometry is None:
+        # Build a minimal geometry so downstream integration works even if the rig did not attach one.
+        geometry = _build_geometry_if_missing(config, fluidflower)
+
+    experiment_start = experiment.experiment_start
+    state = experiment.pressure_temperature_protocol.get_state(experiment_start)
+    gradient = experiment.pressure_temperature_protocol.get_gradient(experiment_start)
+    co2_mass_analysis = darsia.CO2MassAnalysis(
+        baseline=fluidflower.baseline,
+        atmospheric_pressure=state.pressure,
+        atmospheric_temperature=state.temperature,
+        atmospheric_pressure_gradient=gradient.pressure,
+        atmospheric_temperature_gradient=gradient.temperature,
+    )
+
+    flash = darsia.SimpleFlash(
+        min_value_aq=0,
+        max_value_aq=0.75,
+        min_value_g=0.75,
+        max_value_g=1.0,
+        restoration=None,
+    )
+
+    restoration = None
+    try:
+        restoration = darsia.VolumeAveraging(
+            rev=darsia.REV(size=0.005, img=fluidflower.baseline),
+            mask=image_porosity,
+        )
+    except Exception:
+        restoration = None
+
+    calibration = HeterogeneousColorToMassAnalysis(
+        baseline=fluidflower.baseline,
+        labels=fluidflower.labels,
+        color_mode=darsia.ColorMode.RELATIVE,
+        color_path_interpretation=color_path_interpretation,
+        signal_functions=signal_functions,
+        flash=flash,
+        co2_mass_analysis=co2_mass_analysis,
+        geometry=geometry,
+        restoration=restoration,
+        ignore_labels=config.color_paths.ignore_labels + ignore_labels,
+    )
+    return calibration
+
+
+# ---------------------------------------------------------------------------
+# Evaluation and optimization
+
+
+def evaluate_run(
+    context: CalibrationContext,
+    params: Mapping[str, Any],
+) -> EvalResult:
+    calib = copy.deepcopy(context.calibration)
+    # In newer DARSiA the calibration may not carry baseline/labels; copy from rig to keep shapes aligned.
+    try:
+        calib.baseline = context.fluidflower.baseline
+    except Exception:
+        pass
+    try:
+        calib.labels = context.fluidflower.labels
+    except Exception:
+        pass
+    apply_params_to_calibration(
+        calib, params, context.param_space, per_label=context.per_label_params
+    )
+    if not getattr(context, "_param_debug_logged", False):
+        entries = context.param_space or PARAM_SPACE_TEMPLATE
+        requested: Dict[str, Any] = {}
+        actual: Dict[str, Any] = {}
+        for entry in entries:
+            name = entry.get("name")
+            if not name:
+                continue
+            if name in params:
+                requested[name] = params[name]
+            attr_path = entry.get("attr_path")
+            if not attr_path:
+                continue
+            value = _get_attr_path(calib, attr_path)
+            if isinstance(value, np.ndarray):
+                if value.size == 1:
+                    actual[name] = float(value.reshape(-1)[0])
+                else:
+                    actual[name] = f"array(shape={value.shape})"
+            else:
+                try:
+                    actual[name] = float(value)
+                except Exception:
+                    actual[name] = value
+        signal_functions = getattr(calib, "signal_functions", None)
+        signal_labels = None
+        if isinstance(signal_functions, dict):
+            try:
+                signal_labels = sorted(signal_functions.keys())
+            except Exception:
+                signal_labels = None
+        ignore_labels = getattr(calib, "ignore_labels", None)
+        model_info = _probe_signal_model(calib, context.reference_label)
+        context._debug_info_params = {
+            "requested": requested,
+            "actual": actual,
+            "signal_labels": signal_labels,
+            "ignore_labels": ignore_labels,
+            "model_info": model_info,
+            "signal_label": context.signal_label,
+            "signal_labels_context": context.signal_labels,
+            "per_label_params": context.per_label_params,
+        }
+        setattr(context, "_param_debug_logged", True)
+
+    label_weights: Dict[int, float] = {}
+    if context.use_label_weights and context.label_weights:
+        for key, weight in context.label_weights.items():
+            try:
+                label = int(key)
+                label_weights[label] = float(weight)
+            except Exception:
+                continue
+    label_weight_map = None
+
+    total_error = 0.0
+    objective_integral = _normalize_objective_integral(
+        getattr(context, "objective_integral", "off")
+    )
+    error_samples: List[Tuple[float, float]] = []
+    feasible = True
+    metrics: Dict[str, Metrics] = {}
+    debug_scale = not getattr(context, "_scale_logged", False)
+    debug_pre = not getattr(context, "_pre_scale_logged", False)
+    _IMAGE_CACHE.set_max(_resolve_cache_size(context))
+    def _stats_dict(value: Any) -> Dict[str, Any]:
+        try:
+            arr = getattr(value, "img", value)
+            arr = np.array(arr, dtype=float)
+            if arr.size == 0:
+                return {"empty": True}
+            return {
+                "min": float(np.nanmin(arr)),
+                "mean": float(np.nanmean(arr)),
+                "max": float(np.nanmax(arr)),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+    def _stats_text(label: str, value: Any) -> str:
+        info = _stats_dict(value)
+        if "error" in info:
+            return f"{label}=unavailable({info['error']})"
+        if info.get("empty"):
+            return f"{label}=empty"
+        return (
+            f"{label}=min={info['min']:.6g} "
+            f"mean={info['mean']:.6g} "
+            f"max={info['max']:.6g}"
+        )
+    # Debug log shapes once to diagnose mismatch issues.
+    global _SHAPES_LOGGED  # type: ignore
+    try:
+        _SHAPES_LOGGED
+    except NameError:
+        _SHAPES_LOGGED = False  # type: ignore
+    global _SHAPES_LOGGED_ONCE  # type: ignore
+    try:
+        _SHAPES_LOGGED_ONCE
+    except NameError:
+        _SHAPES_LOGGED_ONCE = False  # type: ignore
+
+    for img_path in context.calibration_images:
+        try:
+            img = _load_calibration_image(context, img_path)
+            img_date = getattr(img, "date", None)
+            calib, img = _align_image_to_baseline(calib, img, context.fluidflower)
+            if img_date is None:
+                img_date = getattr(img, "date", None)
+            if not _SHAPES_LOGGED_ONCE:  # type: ignore
+                def _scan(obj) -> str:
+                    hits = []
+                    try:
+                        for name, val in vars(obj).items():
+                            shp = np.shape(getattr(val, "img", val))
+                            hits.append(f"{name}={shp}")
+                        return "; ".join(hits)
+                    except Exception:
+                        return ""
+                base_shape = getattr(getattr(calib, "baseline", None), "img", getattr(calib, "baseline", None))
+                lbl_shape = getattr(getattr(calib, "labels", None), "img", getattr(calib, "labels", None))
+                por_shape = getattr(getattr(context.fluidflower, "image_porosity", None), "img", getattr(context.fluidflower, "image_porosity", None))
+                geo_shape = getattr(getattr(context.fluidflower, "geometry", None), "num_voxels", None)
+                img_shape = getattr(img, "img", img)
+                rig_scan = _scan(context.fluidflower)
+                print(
+                    f"[{context.run}] debug-once baseline={np.shape(base_shape)} "
+                    f"labels={np.shape(lbl_shape)} porosity={np.shape(por_shape)} "
+                    f"image={np.shape(img_shape)} geometry_vox={geo_shape}; rig_attrs={rig_scan}"
+                )
+                _SHAPES_LOGGED_ONCE = True  # type: ignore
+            if not _SHAPES_LOGGED:  # type: ignore
+                base_shape = getattr(getattr(calib, "baseline", None), "img", getattr(calib, "baseline", None))
+                lbl_shape = getattr(getattr(calib, "labels", None), "img", getattr(calib, "labels", None))
+                img_shape = getattr(img, "img", img)
+                print(
+                    f"[{context.run}] shapes baseline={np.shape(base_shape)} "
+                    f"labels={np.shape(lbl_shape)} img={np.shape(img_shape)}"
+                )
+                _SHAPES_LOGGED = True  # type: ignore
+            if debug_pre:
+                geo = context.geometry
+                dims = getattr(geo, "dimensions", None)
+                vox = getattr(geo, "num_voxels", None)
+                vsize = getattr(geo, "voxel_size", None)
+                vvol = getattr(geo, "voxel_volume", None)
+                weight_stats = _stats_text("weight", getattr(geo, "weight", None))
+                por_stats = _stats_text("porosity", getattr(geo, "porosity", None))
+                depth_stats = _stats_text("depth", getattr(geo, "depth", None))
+                print(
+                    f"[{context.run}] debug-pre dims={dims} vox={vox} "
+                    f"voxel_size={vsize} voxel_volume={vvol} "
+                    f"{por_stats} {depth_stats} {weight_stats}"
+                )
+                voxel_volume = None
+                if vvol is not None:
+                    try:
+                        voxel_volume = float(vvol)
+                    except Exception:
+                        voxel_volume = _stats_dict(vvol)
+                context._debug_info_pre = {
+                    "dims": list(dims) if dims is not None else None,
+                    "vox": list(vox) if vox is not None else None,
+                    "voxel_size": list(vsize) if vsize is not None else None,
+                    "voxel_volume": voxel_volume,
+                    "porosity": _stats_dict(getattr(geo, "porosity", None)),
+                    "depth": _stats_dict(getattr(geo, "depth", None)),
+                    "weight": _stats_dict(getattr(geo, "weight", None)),
+                }
+                setattr(context, "_pre_scale_logged", True)
+                debug_pre = False
+            mass_result = calib(img)
+        except Exception as exc:
+            # Attach shape diagnostics to the status to pinpoint mismatches.
+            try:
+                b = getattr(getattr(calib, "baseline", None), "img", getattr(calib, "baseline", None))
+                l = getattr(getattr(calib, "labels", None), "img", getattr(calib, "labels", None))
+                i = getattr(img, "img", img)
+                shape_info = f"shapes b={np.shape(b)} l={np.shape(l)} i={np.shape(i)}"
+            except Exception:
+                shape_info = "shapes unavailable"
+            # Recursive scan for any arrays with a 5504 dimension.
+            def _scan_shapes(candidate, prefix="obj", depth=0, seen=None):
+                if seen is None:
+                    seen = set()
+                hits = []
+                if depth > 2:
+                    return hits
+                if id(candidate) in seen:
+                    return hits
+                seen.add(id(candidate))
+                try:
+                    items_iter = vars(candidate).items()
+                except Exception:
+                    return hits
+                for name, val in items_iter:
+                    shp = None
+                    try:
+                        shp = np.shape(getattr(val, "img", val))
+                    except Exception:
+                        pass
+                    if shp and any(dim == 5504 for dim in shp if isinstance(dim, (int, np.integer))):
+                        hits.append(f"{prefix}.{name}={shp}")
+                    # Recurse into lists/tuples to catch corrections, etc.
+                    if isinstance(val, (list, tuple)):
+                        for idx, sub in enumerate(val):
+                            shp_sub = None
+                            try:
+                                shp_sub = np.shape(getattr(sub, "img", sub))
+                            except Exception:
+                                pass
+                            if shp_sub and any(dim == 5504 for dim in shp_sub if isinstance(dim, (int, np.integer))):
+                                hits.append(f"{prefix}.{name}[{idx}]={shp_sub}")
+                            if hasattr(sub, "__dict__"):
+                                hits.extend(_scan_shapes(sub, f"{prefix}.{name}[{idx}]", depth + 1, seen))
+                    if hasattr(val, "__dict__"):
+                        hits.extend(_scan_shapes(val, f"{prefix}.{name}", depth + 1, seen))
+                return hits
+            hits_calib = _scan_shapes(calib)
+            hits_rig = _scan_shapes(context.fluidflower)
+            extra = ""
+            if hits_calib:
+                extra += " calib5504[" + ";".join(hits_calib) + "]"
+            if hits_rig:
+                extra += " rig5504[" + ";".join(hits_rig) + "]"
+            import traceback
+            tb = traceback.format_exc(limit=1).strip().replace("\n", " | ")
+            return EvalResult(
+                objective=PENALTY_VALUE,
+                feasible=False,
+                metrics={},
+                status=f"eval-error:{exc}; {shape_info}{extra}; {tb}",
+                params=dict(params),
+            )
+
+        if img_date is None:
+            try:
+                img_date = context.experiment.experiment_start
+            except Exception:
+                img_date = None
+        injected = context.experiment.injection_protocol.injected_mass(img_date)
+        if debug_scale:
+            geo = context.geometry
+            dims = getattr(geo, "dimensions", None)
+            vox = getattr(geo, "num_voxels", None)
+            vsize = getattr(geo, "voxel_size", None)
+            vvol = getattr(geo, "voxel_volume", None)
+            weight_stats = _stats_text("weight", getattr(geo, "weight", None))
+            por_stats = _stats_text("porosity", getattr(geo, "porosity", None))
+            depth_stats = _stats_text("depth", getattr(geo, "depth", None))
+            mass_stats = _stats_text("mass", getattr(mass_result, "mass", None))
+            print(
+                f"[{context.run}] debug-scale date={img_date} injected={float(injected):.6g} "
+                f"dims={dims} vox={vox} voxel_size={vsize} voxel_volume={vvol} "
+                f"{por_stats} {depth_stats} {weight_stats} {mass_stats}"
+            )
+            context._debug_info_scale = {
+                "date": str(img_date) if img_date is not None else None,
+                "injected": float(injected) if injected is not None else None,
+                "mass": _stats_dict(getattr(mass_result, "mass", None)),
+            }
+            setattr(context, "_scale_logged", True)
+            debug_scale = False
+        mass_map = mass_result.mass
+        if label_weights:
+            mass_arr = np.array(getattr(mass_map, "img", mass_map))
+            if label_weight_map is None or label_weight_map.shape != mass_arr.shape:
+                labels_arr = getattr(calib, "labels", None)
+                labels_arr = getattr(labels_arr, "img", labels_arr)
+                try:
+                    labels_arr = np.array(labels_arr)
+                except Exception:
+                    labels_arr = None
+                if labels_arr is None:
+                    label_weights = {}
+                else:
+                    if labels_arr.shape != mass_arr.shape:
+                        try:
+                            fx = mass_arr.shape[1] / labels_arr.shape[1]
+                            fy = mass_arr.shape[0] / labels_arr.shape[0]
+                            labels_arr = darsia.resize(
+                                labels_arr,
+                                fx=fx,
+                                fy=fy,
+                                interpolation="inter_nearest",
+                            )
+                        except Exception:
+                            labels_arr = None
+                    if labels_arr is None or labels_arr.shape != mass_arr.shape:
+                        label_weights = {}
+                    else:
+                        label_weight_map = np.ones_like(mass_arr, dtype=float)
+                        for label, weight in label_weights.items():
+                            label_weight_map[labels_arr == label] = weight
+            if label_weights and label_weight_map is not None:
+                total_mass = context.geometry.integrate(mass_arr * label_weight_map)
+            else:
+                total_mass = context.geometry.integrate(mass_map)
+        else:
+            total_mass = context.geometry.integrate(mass_map)
+        metric_key: Any = img_path.stem
+        if img_date is not None:
+            try:
+                metric_key = round(float(context.experiment.time_since_start(img_date)), 6)
+            except Exception:
+                metric_key = img_path.stem
+        else:
+            try:
+                metric_date = context.experiment.imaging_protocol.get_datetime(Path(img_path))
+                if metric_date is not None:
+                    metric_key = round(float(context.experiment.time_since_start(metric_date)), 6)
+            except Exception:
+                metric_key = img_path.stem
+        metrics[metric_key] = Metrics(
+            injected_full=float(injected),
+            total_full=float(total_mass),
+        )
+
+        if context.enforce_lower and total_mass > injected:
+            feasible = False
+        error = float(total_mass) - float(injected)
+        total_error += abs(error)
+        if objective_integral != "off":
+            try:
+                t_val = float(metric_key)
+            except Exception:
+                t_val = None
+            if t_val is not None:
+                error_samples.append((t_val, error))
+
+    if objective_integral != "off" and len(error_samples) >= 2:
+        error_samples.sort(key=lambda item: item[0])
+        total_integral = 0.0
+        prev_t, prev_e = error_samples[0]
+        prev_f = abs(prev_e) if objective_integral == "l1" else prev_e * prev_e
+        for t_val, e_val in error_samples[1:]:
+            dt = t_val - prev_t
+            if dt <= 0:
+                continue
+            f_val = abs(e_val) if objective_integral == "l1" else e_val * e_val
+            total_integral += 0.5 * (prev_f + f_val) * dt
+            prev_t, prev_f = t_val, f_val
+        if total_integral > 0.0:
+            total_error = total_integral
+
+    objective = total_error if (feasible or not context.enforce_lower) else PENALTY_VALUE
+    return EvalResult(
+        objective=objective,
+        feasible=feasible,
+        metrics=metrics,
+        status="ok",
+        params=dict(params),
+    )
+
+
+def optimize_per_run(
+    context: CalibrationContext,
+    max_iters: int,
+    init_params: Optional[Dict[str, Any]] = None,
+    temp_log_path: Optional[Path] = None,
+    warmup_iters: int = 100,
+    warmup_levels: Optional[Sequence[float]] = None,
+    warmup_levels_by_idx: Optional[Dict[int, int]] = None,
+    warmup_levels_default: Optional[int] = None,
+    warmup_high: Optional[float] = None,
+    warmup_mode: str = "prefix",
+) -> Tuple[Optional[Dict[str, Any]], Optional[EvalResult], List[Dict[str, Any]], Optional[EvalResult]]:
+    history: List[Dict[str, Any]] = []
+    best_eval: Optional[EvalResult] = None
+    best_params: Optional[Dict[str, Any]] = None
+    best_feasible: Optional[EvalResult] = None
+    best_feasible_params: Optional[Dict[str, Any]] = None
+    baseline_eval: Optional[EvalResult] = None
+    header_written = False
+    study = optuna.create_study(direction="minimize")
+
+    def _append_temp(row: Dict[str, Any]) -> None:
+        nonlocal header_written
+        if temp_log_path is None:
+            return
+        temp_log_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a"
+        with temp_log_path.open(mode, newline="") as f:
+            fieldnames = [
+                "iter",
+                "objective",
+                "feasible",
+                "status",
+                "params",
+                "metrics",
+                "best",
+                "debug_pre",
+                "debug_scale",
+                "debug_params",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not header_written:
+                writer.writeheader()
+                header_written = True
+            writer.writerow(row)
+
+    if init_params is not None:
+        init_eval = evaluate_run(context, init_params)
+        debug_pre = getattr(context, "_debug_info_pre", None)
+        debug_scale = getattr(context, "_debug_info_scale", None)
+        debug_params = getattr(context, "_debug_info_params", None)
+        row = {
+            "iter": 0,
+            "objective": init_eval.objective,
+            "feasible": init_eval.feasible,
+            "status": init_eval.status,
+            "params": init_params,
+            "metrics": {
+                k: {
+                    "injected_full": v.injected_full,
+                    "total_full": v.total_full,
+                }
+                for k, v in init_eval.metrics.items()
+            },
+            "best": False,
+            "debug_pre": json.dumps(debug_pre) if debug_pre else "",
+            "debug_scale": json.dumps(debug_scale) if debug_scale else "",
+            "debug_params": json.dumps(debug_params, default=str) if debug_params else "",
+        }
+        history.append(row)
+        _append_temp(row)
+        if debug_pre is not None:
+            setattr(context, "_debug_info_pre", None)
+        if debug_scale is not None:
+            setattr(context, "_debug_info_scale", None)
+        if debug_params is not None:
+            setattr(context, "_debug_info_params", None)
+        baseline_eval = init_eval
+        best_eval = init_eval
+        best_params = init_params
+        if init_eval.feasible:
+            best_feasible = init_eval
+            best_feasible_params = init_params
+        study.enqueue_trial(init_params)
+        study.tell(study.ask(fixed_params=init_params), init_eval.objective)
+
+    def _enqueue_warmups() -> None:
+        nonlocal best_eval, best_params, best_feasible, best_feasible_params
+        warmups: List[Dict[str, Any]] = []
+        # Prep value entries (value1..N). For per-label mode, we use a template
+        # label for warmup sweeps and apply the same profile across all labels.
+        val_entries_by_label = _value_entries_by_label(context.param_space)
+        template_label = None
+        if val_entries_by_label:
+            if context.signal_label in val_entries_by_label:
+                template_label = context.signal_label
+            else:
+                template_label = sorted(val_entries_by_label.keys())[0]
+        template_entries: List[Dict[str, Any]] = []
+        if template_label is not None:
+            template_entries = [
+                e
+                for e in val_entries_by_label.get(template_label, [])
+                if (_parse_signal_name(e["name"]) or (None, 0))[1] != 0
+            ]
+
+        bounds_by_idx: Dict[int, Tuple[float, float]] = {}
+        high_by_idx: Dict[int, float] = {}
+        for entry in template_entries:
+            parsed = _parse_signal_name(entry["name"])
+            if not parsed:
+                continue
+            _, idx = parsed
+            low, high = entry["bounds"]
+            if warmup_high is not None:
+                high = min(high, warmup_high)
+            bounds_by_idx[idx] = (low, high)
+            high_by_idx[idx] = high
+
+        high_lookup: Dict[str, float] = {}
+        for entries in val_entries_by_label.values():
+            for entry in entries:
+                parsed = _parse_signal_name(entry["name"])
+                if not parsed:
+                    continue
+                _, idx = parsed
+                if idx == 0:
+                    continue
+                hi = entry["bounds"][1]
+                if warmup_high is not None:
+                    hi = min(hi, warmup_high)
+                high_lookup[entry["name"]] = hi
+        warmup_levels_by_idx = warmup_levels_by_idx or {}
+        use_grid_levels = bool(warmup_levels_by_idx or warmup_levels_default is not None)
+        default_levels = [1.75, 1.5, 1.25, 1.0, 0.75, 0.5, 0.3, 0.1]
+        if use_grid_levels:
+            default_count = warmup_levels_default
+            if default_count is None:
+                default_count = len(warmup_levels) if warmup_levels else len(default_levels)
+        else:
+            explicit_levels = list(warmup_levels) if warmup_levels else default_levels
+
+        def _levels_for_idx(idx: int, low: float, high: float) -> List[float]:
+            if use_grid_levels:
+                count = warmup_levels_by_idx.get(idx, default_count)
+                return _linspace(low, high, count)
+            return list(explicit_levels)
+        # All high within bounds
+        all_high = {}
+        for e in context.param_space:
+            if e["name"] in high_lookup:
+                all_high[e["name"]] = high_lookup[e["name"]]
+            else:
+                all_high[e["name"]] = e["bounds"][1]
+        warmups.append(all_high)
+        # All low within bounds
+        all_low = {e["name"]: e["bounds"][0] for e in context.param_space}
+        warmups.append(all_low)
+        # Mid values
+        mid = {}
+        for e in context.param_space:
+            if e["name"] in high_lookup:
+                mid[e["name"]] = 0.5 * (e["bounds"][0] + high_lookup[e["name"]])
+            else:
+                mid[e["name"]] = 0.5 * (e["bounds"][0] + e["bounds"][1])
+        warmups.append(mid)
+
+        def _apply_profile_values(profile: Dict[str, Any], idx_values: Dict[int, float]) -> None:
+            for entries in val_entries_by_label.values():
+                for entry in entries:
+                    parsed = _parse_signal_name(entry["name"])
+                    if not parsed:
+                        continue
+                    _, idx = parsed
+                    if idx not in idx_values:
+                        continue
+                    low, high = entry["bounds"]
+                    if warmup_high is not None:
+                        high = min(high, warmup_high)
+                    profile[entry["name"]] = max(low, min(high, idx_values[idx]))
+
+        def _apply_label_values(
+            profile: Dict[str, Any], label: int, idx_values: Dict[int, float]
+        ) -> None:
+            for entry in val_entries_by_label.get(label, []):
+                parsed = _parse_signal_name(entry["name"])
+                if not parsed:
+                    continue
+                _, idx = parsed
+                if idx not in idx_values:
+                    continue
+                low, high = entry["bounds"]
+                if warmup_high is not None:
+                    high = min(high, warmup_high)
+                profile[entry["name"]] = max(low, min(high, idx_values[idx]))
+
+        if context.per_label_params and val_entries_by_label:
+            labels = sorted(val_entries_by_label.keys())
+            for label in labels:
+                label_entries = [
+                    e
+                    for e in val_entries_by_label.get(label, [])
+                    if (_parse_signal_name(e["name"]) or (None, 0))[1] != 0
+                ]
+                if not label_entries:
+                    continue
+                for idx_pos, entry in enumerate(label_entries):
+                    parsed = _parse_signal_name(entry["name"])
+                    if not parsed:
+                        continue
+                    _, idx_pos_val = parsed
+                    low, high = entry["bounds"]
+                    if warmup_high is not None:
+                        high = min(high, warmup_high)
+                    levels = _levels_for_idx(idx_pos_val, low, high)
+                    for lvl in levels:
+                        profile = dict(all_high)
+                        idx_values: Dict[int, float] = {}
+                        for j, e in enumerate(label_entries):
+                            parsed = _parse_signal_name(e["name"])
+                            if not parsed:
+                                continue
+                            _, idx = parsed
+                            low_j, high_j = e["bounds"]
+                            if warmup_high is not None:
+                                high_j = min(high_j, warmup_high)
+                            if warmup_mode == "prefix":
+                                if j <= idx_pos:
+                                    idx_values[idx] = max(low_j, min(high_j, lvl))
+                                else:
+                                    idx_values[idx] = high_j
+                            elif warmup_mode == "suffix":
+                                if j < idx_pos:
+                                    idx_values[idx] = low_j
+                                else:
+                                    idx_values[idx] = max(low_j, min(high_j, lvl))
+                            else:
+                                if j == idx_pos:
+                                    idx_values[idx] = max(low_j, min(high_j, lvl))
+                        _apply_label_values(profile, label, idx_values)
+                        warmups.append(profile)
+        elif template_entries:
+            if warmup_mode == "prefix":
+                for idx_pos, entry in enumerate(template_entries):
+                    parsed = _parse_signal_name(entry["name"])
+                    if not parsed:
+                        continue
+                    _, idx_pos_val = parsed
+                    low, high = bounds_by_idx.get(idx_pos_val, entry["bounds"])
+                    levels = _levels_for_idx(idx_pos_val, low, high)
+                    for lvl in levels:
+                        profile = dict(all_high)
+                        idx_values: Dict[int, float] = {}
+                        for j, e in enumerate(template_entries):
+                            parsed = _parse_signal_name(e["name"])
+                            if not parsed:
+                                continue
+                            _, idx = parsed
+                            low_j, high_j = bounds_by_idx.get(idx, e["bounds"])
+                            if j <= idx_pos:
+                                idx_values[idx] = max(low_j, min(high_j, lvl))
+                            else:
+                                idx_values[idx] = high_j
+                        _apply_profile_values(profile, idx_values)
+                        warmups.append(profile)
+            elif warmup_mode == "suffix":
+                for idx_pos, entry in enumerate(template_entries):
+                    parsed = _parse_signal_name(entry["name"])
+                    if not parsed:
+                        continue
+                    _, idx_pos_val = parsed
+                    low, high = bounds_by_idx.get(idx_pos_val, entry["bounds"])
+                    levels = _levels_for_idx(idx_pos_val, low, high)
+                    for lvl in levels:
+                        profile = dict(all_high)
+                        idx_values: Dict[int, float] = {}
+                        for j, e in enumerate(template_entries):
+                            parsed = _parse_signal_name(e["name"])
+                            if not parsed:
+                                continue
+                            _, idx = parsed
+                            low_j, high_j = bounds_by_idx.get(idx, e["bounds"])
+                            if j < idx_pos:
+                                idx_values[idx] = low_j
+                            else:
+                                idx_values[idx] = max(low_j, min(high_j, lvl))
+                        _apply_profile_values(profile, idx_values)
+                        warmups.append(profile)
+            else:
+                for entry in template_entries:
+                    parsed = _parse_signal_name(entry["name"])
+                    if not parsed:
+                        continue
+                    _, idx = parsed
+                    low, high = bounds_by_idx.get(idx, entry["bounds"])
+                    levels = _levels_for_idx(idx, low, high)
+                    for lvl in levels:
+                        profile = dict(all_high)
+                        _apply_profile_values(profile, {idx: max(low, min(high, lvl))})
+                        warmups.append(profile)
+        seen = set()
+        distributions = {
+            e["name"]: (
+                IntUniformDistribution(int(e["bounds"][0]), int(e["bounds"][1]))
+                if e.get("type", "float") == "int"
+                else UniformDistribution(float(e["bounds"][0]), float(e["bounds"][1]))
+            )
+            for e in context.param_space
+        }
+        # Add random monotonic samples in addition to the grid.
+        for _ in range(max(0, warmup_iters)):
+            warmups.append(sample_params(context.param_space))
+
+        for wp in warmups:
+            key = tuple(sorted(wp.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            eval_result = evaluate_run(context, wp)
+            debug_pre = getattr(context, "_debug_info_pre", None)
+            debug_scale = getattr(context, "_debug_info_scale", None)
+            debug_params = getattr(context, "_debug_info_params", None)
+            row = {
+                "iter": len(history),
+                "objective": eval_result.objective,
+                "feasible": eval_result.feasible,
+                "status": eval_result.status,
+                "params": wp,
+                "metrics": {
+                    k: {
+                        "injected_full": v.injected_full,
+                        "total_full": v.total_full,
+                    }
+                    for k, v in eval_result.metrics.items()
+                },
+                "best": False,
+                "debug_pre": json.dumps(debug_pre) if debug_pre else "",
+                "debug_scale": json.dumps(debug_scale) if debug_scale else "",
+                "debug_params": json.dumps(debug_params, default=str) if debug_params else "",
+            }
+            history.append(row)
+            _append_temp(row)
+            if debug_pre is not None:
+                setattr(context, "_debug_info_pre", None)
+            if debug_scale is not None:
+                setattr(context, "_debug_info_scale", None)
+            if debug_params is not None:
+                setattr(context, "_debug_info_params", None)
+            trial = optuna.trial.create_trial(
+                params=wp,
+                distributions=distributions,
+                value=eval_result.objective,
+            )
+            study.add_trial(trial)
+            if best_eval is None or eval_result.objective < best_eval.objective:
+                best_eval = eval_result
+                best_params = wp
+            if eval_result.feasible and (best_feasible is None or eval_result.objective < best_feasible.objective):
+                best_feasible = eval_result
+                best_feasible_params = wp
+
+    _enqueue_warmups()
+
+    iter_offset = -1
+    if history:
+        try:
+            iter_offset = int(history[-1].get("iter", -1))
+        except Exception:
+            iter_offset = len(history) - 1
+
+    total_iters = iter_offset + max_iters if iter_offset >= 0 else max_iters
+    for idx in range(1, max_iters + 1):
+        current_iter = iter_offset + idx
+        if idx % 5 == 0:
+            print(
+                f"[{context.run}] starting iteration {current_iter}/{total_iters}"
+            )
+        trial = study.ask()
+        params = suggest_params_trial(trial, context.param_space)
+        eval_result = evaluate_run(context, params)
+        debug_pre = getattr(context, "_debug_info_pre", None)
+        debug_scale = getattr(context, "_debug_info_scale", None)
+        debug_params = getattr(context, "_debug_info_params", None)
+        row = {
+            "iter": iter_offset + idx,
+            "objective": eval_result.objective,
+            "feasible": eval_result.feasible,
+            "status": eval_result.status,
+            "params": params,
+            "metrics": {
+                k: {
+                    "injected_full": v.injected_full,
+                    "total_full": v.total_full,
+                }
+                for k, v in eval_result.metrics.items()
+            },
+            "best": False,
+            "debug_pre": json.dumps(debug_pre) if debug_pre else "",
+            "debug_scale": json.dumps(debug_scale) if debug_scale else "",
+            "debug_params": json.dumps(debug_params, default=str) if debug_params else "",
+        }
+        history.append(row)
+        _append_temp(row)
+        if debug_pre is not None:
+            setattr(context, "_debug_info_pre", None)
+        if debug_scale is not None:
+            setattr(context, "_debug_info_scale", None)
+        if debug_params is not None:
+            setattr(context, "_debug_info_params", None)
+        study.tell(trial, eval_result.objective)
+
+        if best_eval is None or eval_result.objective < best_eval.objective:
+            best_eval = eval_result
+            best_params = params
+        if eval_result.feasible and (best_feasible is None or eval_result.objective < best_feasible.objective):
+            best_feasible = eval_result
+            best_feasible_params = params
+
+        if idx == max_iters:
+            print(f"[{context.run}] completed {current_iter}/{total_iters} iterations")
+
+    chosen_eval = best_feasible or best_eval
+    chosen_params = best_feasible_params or best_params
+    for row in history:
+        row["best"] = False
+    if chosen_eval is not None:
+        for row in history:
+            if abs(float(row["objective"]) - float(chosen_eval.objective)) < 1e-12 and bool(row["feasible"]) == bool(chosen_eval.feasible):
+                row["best"] = True
+                break
+    return chosen_params, chosen_eval, history, baseline_eval
+
+
+def optimize_global(
+    contexts: Sequence[CalibrationContext],
+    max_iters: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[EvalResult], List[Dict[str, Any]]]:
+    history: List[Dict[str, Any]] = []
+    best_eval: Optional[EvalResult] = None
+    best_params: Optional[Dict[str, Any]] = None
+    best_feasible: Optional[EvalResult] = None
+    best_feasible_params: Optional[Dict[str, Any]] = None
+
+    for idx in range(1, max_iters + 1):
+        params = sample_params(contexts[0].param_space if contexts else PARAM_SPACE_TEMPLATE)
+        aggregated_metrics: Dict[str, Metrics] = {}
+        feasible = True
+        total_objective = 0.0
+        status_parts: List[str] = []
+        for context in contexts:
+            eval_result = evaluate_run(context, params)
+            status_parts.append(eval_result.status)
+            aggregated_metrics.update(
+                {f"{context.run}:{k}": v for k, v in eval_result.metrics.items()}
+            )
+            if not eval_result.feasible:
+                feasible = False
+            total_objective += eval_result.objective
+        combined_eval = EvalResult(
+            objective=total_objective if feasible else PENALTY_VALUE,
+            feasible=feasible,
+            metrics=aggregated_metrics,
+            status=";".join(status_parts),
+            params=dict(params),
+        )
+        history.append(
+            {
+                "iter": idx,
+                "objective": combined_eval.objective,
+                "feasible": combined_eval.feasible,
+                "status": combined_eval.status,
+                "params": params,
+            }
+        )
+
+        if best_eval is None or combined_eval.objective < best_eval.objective:
+            best_eval = combined_eval
+            best_params = params
+        if combined_eval.feasible and (best_feasible is None or combined_eval.objective < best_feasible.objective):
+            best_feasible = combined_eval
+            best_feasible_params = params
+
+    chosen_eval = best_feasible or best_eval
+    chosen_params = best_feasible_params or best_params
+    return chosen_params, chosen_eval, history
+
+
+# ---------------------------------------------------------------------------
+# Persistence and reporting
+
+
+def write_history_csv(path: Path, history: Iterable[Mapping[str, Any]]) -> None:
+    fieldnames = [
+        "iter",
+        "objective",
+        "feasible",
+        "status",
+        "params",
+        "metrics",
+        "best",
+        "debug_pre",
+        "debug_scale",
+        "debug_params",
+        "settings",
+        "sanity",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow(row)
+
+
+def save_best_calibration(
+    context: CalibrationContext,
+    params: Mapping[str, Any],
+    out_folder: Path,
+    per_label_override: Optional[bool] = None,
+) -> None:
+    calib = copy.deepcopy(context.calibration)
+    apply_params_to_calibration(
+        calib,
+        params,
+        context.param_space,
+        per_label=per_label_override
+        if per_label_override is not None
+        else context.per_label_params,
+    )
+    out_folder.mkdir(parents=True, exist_ok=True)
+    calib.save(out_folder)
+
+
+def summarize_result(label: str, params: Mapping[str, Any], eval_result: EvalResult) -> None:
+    print(f"\nRun: {label}")
+    print(f"Best params: {params}")
+    if eval_result and eval_result.metrics:
+        any_metric = next(iter(eval_result.metrics.values()))
+        print(
+            f"Injected (example): {any_metric.injected_full}, Total (example): {any_metric.total_full}, "
+            f"Objective: {eval_result.objective}, Feasible: {eval_result.feasible}"
+        )
+    print(f"Status: {eval_result.status}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed()
+
+    config_dir = Path(args.config_dir)
+    logs_dir = Path(args.logs_dir)
+    ref_config_path = Path(args.ref_config) if args.ref_config else None
+    bounds_map = load_bounds_map(Path(args.bounds_file)) if args.bounds_file else {}
+    param_ranges = _parse_param_ranges(args.param_ranges)
+    param_levels_default, param_levels_by_idx = _parse_param_levels(args.param_levels)
+    bounds_map = _apply_param_ranges(bounds_map, args.runs, param_ranges)
+    label_weights = _parse_label_weights(args.label_weights)
+    auto_label_weights = bool(args.use_label_weights and args.auto_label_weights and not label_weights)
+    warmup_levels = None
+    if args.warmup_levels:
+        warmup_levels = [float(x) for x in args.warmup_levels.split(",") if x.strip()]
+        if not warmup_levels:
+            warmup_levels = None
+
+    init_params = None
+    if args.init_from_best:
+        try:
+            from scripts.auto_calib_init_loader import load_best_params_from_csv
+        except Exception:
+            load_best_params_from_csv = None
+        if load_best_params_from_csv:
+            init_params = load_best_params_from_csv(Path(args.init_from_best))
+            if init_params:
+                print(f"Loaded initial params from {args.init_from_best}")
+
+    from darsia.presets.workflows.rig import Rig
+
+    contexts: List[CalibrationContext] = []
+    for run in args.runs:
+        ctx = build_context(
+            run=run,
+            config_dir=config_dir,
+            rig_cls=Rig,
+            ref_config_path=ref_config_path,
+            use_facies=args.use_facies,
+            bounds_map=bounds_map,
+            enforce_lower=args.enforce_lower,
+            per_label_params=args.per_label,
+            use_label_weights=args.use_label_weights,
+            label_weights=label_weights,
+            quality_scale=args.quality_scale,
+            quality_dtype=args.quality_dtype,
+            objective_integral=args.objective_integral,
+        )
+        if auto_label_weights:
+            auto_weights = compute_auto_label_weights(ctx)
+            if auto_weights:
+                auto_weights = apply_label_weight_grouping(
+                    auto_weights, ctx, args.label_weight_grouping
+                )
+                ctx.label_weights = auto_weights
+        elif args.label_weight_grouping and label_weights:
+            ctx.label_weights = apply_label_weight_grouping(
+                label_weights, ctx, args.label_weight_grouping
+            )
+        contexts.append(ctx)
+
+    if args.mode == "per-run":
+        for ctx in contexts:
+            chosen_params, eval_result, history, baseline_eval = optimize_per_run(
+                context=ctx,
+                max_iters=args.max_iters,
+                init_params=init_params,
+                temp_log_path=logs_dir / f"tmp_auto_calibration_{ctx.run}.csv",
+                warmup_iters=args.warmup_iters,
+                warmup_levels=warmup_levels,
+                warmup_levels_by_idx=param_levels_by_idx,
+                warmup_levels_default=param_levels_default,
+                warmup_high=args.warmup_high,
+                warmup_mode=args.warmup_mode,
+            )
+            history_path = logs_dir / f"auto_calibration_{ctx.run}.csv"
+            write_history_csv(history_path, history)
+
+            if chosen_params is None or eval_result is None:
+                print(f"No valid results for {ctx.run}. See {history_path} for attempts.")
+                (logs_dir / f"tmp_auto_calibration_{ctx.run}.csv").unlink(missing_ok=True)
+                continue
+
+            out_folder = ctx.config.color_to_mass.calibration_folder.parent / (
+                ctx.config.color_to_mass.calibration_folder.name + "_auto_opt"
+            )
+            if baseline_eval and baseline_eval.objective <= (eval_result.objective if eval_result else PENALTY_VALUE):
+                print(
+                    f"Baseline objective {baseline_eval.objective} <= new objective; keeping existing calibration."
+                )
+            else:
+                save_best_calibration(ctx, chosen_params, out_folder)
+                summarize_result(ctx.run, chosen_params, eval_result)
+                print(f"Saved optimized calibration to {out_folder}")
+            print(f"History written to {history_path}")
+            (logs_dir / f"tmp_auto_calibration_{ctx.run}.csv").unlink(missing_ok=True)
+    else:
+        chosen_params, eval_result, history = optimize_global(
+            contexts=contexts,
+            max_iters=args.max_iters,
+        )
+        history_path = logs_dir / "auto_calibration_global.csv"
+        write_history_csv(history_path, history)
+
+        if chosen_params is None or eval_result is None:
+            print(f"No valid global result. See {history_path} for attempts.")
+            return
+
+        for ctx in contexts:
+            out_folder = ctx.config.color_to_mass.calibration_folder.parent / (
+                ctx.config.color_to_mass.calibration_folder.name + "_auto_opt"
+            )
+            save_best_calibration(ctx, chosen_params, out_folder)
+        summarize_result("global", chosen_params, eval_result)
+        print(f"Saved shared optimized calibrations for runs {args.runs}")
+        print(f"Optimization history written to {history_path}")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main()

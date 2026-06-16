@@ -1,0 +1,48 @@
+{
+  "default": {
+    "flash.max_value_aq": [
+      1.0,
+      1.0
+    ],
+    "flash.min_value_g": [
+      0.75,
+      0.75
+    ],
+    "flash.max_value_g": [
+      1.0,
+      1.5
+    ],
+    "signal.label*.value1": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value2": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value3": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value4": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value5": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value6": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value7": [
+      0.0,
+      4.0
+    ],
+    "signal.label*.value8": [
+      0.0,
+      4.0
+    ]
+  }
+}
