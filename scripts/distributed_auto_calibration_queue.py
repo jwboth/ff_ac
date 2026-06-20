@@ -1432,7 +1432,8 @@ def master_main(args: argparse.Namespace) -> None:
         _clear_queue(queue)   # clear leftover/orphan tasks on startup BY DEFAULT
     dirs = _ensure_queue_dirs(queue)
 
-    logs_dir = Path(args.logs_dir) / _run_tag(args)
+    logs_root = Path(args.logs_dir)
+    logs_dir = logs_root if getattr(args, "exact_logs_dir", False) else logs_root / _run_tag(args)
     logs_dir.mkdir(parents=True, exist_ok=True)
     # Seed an editable in-flight-per-run control file so the dispatch cap can be
     # changed live (the master re-reads max_in_flight_per_run.txt each loop and it
@@ -1664,6 +1665,25 @@ def master_main(args: argparse.Namespace) -> None:
                         state.best_seq = None
                 except Exception:
                     pass
+        done_warmup = sum(1 for _ in dirs["done"].glob(f"{run}_warmup_*.json"))
+        done_optuna = sum(1 for _ in dirs["done"].glob(f"{run}_optuna_*.json"))
+        done_init = sum(1 for _ in dirs["done"].glob(f"{run}_init_*.json"))
+        if done_warmup or done_optuna or done_init:
+            state.warmup_done = done_warmup
+            state.warmup_cursor = min(done_warmup, len(state.warmup_params))
+            state.optuna_done = done_optuna
+            if done_init:
+                state.init_done = True
+                state.init_dispatched = True
+            if state.warmup_done >= len(state.warmup_params) and (
+                state.init_params is None or state.init_done
+            ):
+                state.phase = "optuna"
+            _log_master(
+                f"[{run}] resumed queue progress: warmup_done={state.warmup_done} "
+                f"optuna_done={state.optuna_done} init_done={state.init_done} "
+                f"next_iter={state.next_iter}"
+            )
         if tmp_history_path.exists():
             state.header_written = True
         if sanity_tmp_path.exists():
@@ -2950,6 +2970,11 @@ def build_parser() -> argparse.ArgumentParser:
     master.add_argument("--runs", nargs="+", required=True)
     master.add_argument("--config-dir", default="config/run_ac")
     master.add_argument("--logs-dir", default=_default_calibration_log_root())
+    master.add_argument(
+        "--exact-logs-dir",
+        action="store_true",
+        help="Use --logs-dir exactly instead of creating a timestamped run subfolder.",
+    )
     master.add_argument("--ref-config", default=None)
     master.add_argument(
         "--use-facies",
