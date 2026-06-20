@@ -60,6 +60,17 @@ def _run_step(cmd: list[str], cwd: Path, log_file) -> int:
     return int(proc.returncode)
 
 
+def _config_args(common: Path, config: Path, coloron: Path, config_dir: Path, run: str) -> list[str]:
+    stamp = config_dir / ".color_state" / f"{run}.txt"
+    color_state = "off"
+    if stamp.exists():
+        color_state = stamp.read_text(encoding="utf-8", errors="replace").strip().lower()
+    paths = [str(common), str(config)]
+    if color_state in {"1", "true", "yes", "on"}:
+        paths.append(str(coloron))
+    return paths
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="Z:/Albus/Results")
@@ -123,8 +134,10 @@ def main() -> int:
             status = "ok"
             failed_step = ""
             returncode = 0
+            config_args = _config_args(common, config, coloron, config_dir, run)
             with run_log_path.open("a", encoding="utf-8", errors="replace") as log_file:
                 log_file.write(f"\n===== {datetime.now().isoformat(timespec='seconds')} {run} =====\n")
+                log_file.write(f"config_args={config_args}\n")
                 steps = [
                     (
                         "setup-rig",
@@ -132,9 +145,7 @@ def main() -> int:
                             sys.executable,
                             "scripts/setup.py",
                             "--config",
-                            str(common),
-                            str(config),
-                            str(coloron),
+                            *config_args,
                             "--rig",
                         ],
                     ),
@@ -144,9 +155,7 @@ def main() -> int:
                             sys.executable,
                             "scripts/calibration.py",
                             "--config",
-                            str(common),
-                            str(config),
-                            str(coloron),
+                            *config_args,
                             "--color-embedding",
                         ],
                     ),
@@ -156,9 +165,7 @@ def main() -> int:
                             sys.executable,
                             "scripts/calibration.py",
                             "--config",
-                            str(common),
-                            str(config),
-                            str(coloron),
+                            *config_args,
                             "--default-mass",
                             "--reset",
                         ],

@@ -10,7 +10,7 @@ results = "Z:\\Albus\\Results\\ac44"
 baseline = "DSC00001.JPG"
 
 [data.path.baseline]
-paths = ["DSC00001.JPG", "DSC00002.JPG", "DSC00003.JPG"]
+paths = ["DSC00001.JPG"]
 
 # Shared time grid: dense through BOTH injections, exponential in rest.
 # t=0 = injection ramp-up start; identical across all experiments.
@@ -71,8 +71,6 @@ colored_image = "./data/DSC28507_segmented.png"
 [corrections]
 [corrections.type]
 type = "float32"
-[corrections.drift]
-colorchecker = "upper_right"
 [corrections.curvature.crop]
 pts_src = [[0, 57], [3023, 64], [3000, 5378], [0, 5374]]
 width = 0.9
