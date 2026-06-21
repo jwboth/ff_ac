@@ -190,6 +190,17 @@ def _safe_unlink(path: Path, attempts: int = 3, delay: float = 0.05) -> bool:
     return False
 
 
+def _safe_exists(path: Path, attempts: int = 3, delay: float = 0.05) -> bool:
+    for attempt in range(max(1, attempts)):
+        try:
+            return path.exists()
+        except (PermissionError, OSError):
+            if attempt + 1 >= max(1, attempts):
+                return False
+            time.sleep(delay * (attempt + 1))
+    return False
+
+
 def _load_json_retry(
     path: Path,
     attempts: int = 3,
@@ -1957,7 +1968,8 @@ def master_main(args: argparse.Namespace) -> None:
                 last_seen = None
                 hb_task_id = None
                 hb_interval = None
-                if hb_path.exists():
+                hb_payload = None
+                if _safe_exists(hb_path):
                     hb_payload = _load_json_retry(hb_path)
                 if hb_payload:
                     try:
@@ -2014,7 +2026,7 @@ def master_main(args: argparse.Namespace) -> None:
                 # task-timeout) so it does not linger in in_progress and inflate
                 # the load-balancing counts. The task has already been requeued
                 # (or failed) above.
-                if in_prog_path is not None and in_prog_path.exists():
+                if in_prog_path is not None and _safe_exists(in_prog_path):
                     _safe_unlink(in_prog_path)
                     _log_master(f"delete in_progress {in_prog_path.name} reason={reason}")
                 if attempt >= max_retries:
@@ -2050,7 +2062,7 @@ def master_main(args: argparse.Namespace) -> None:
                     continue  # tracked -> handled by the timeout loop above
                 _ls = None
                 _hb = dirs["heartbeats"] / f"{_wk}.json"
-                if _hb.exists():
+                if _safe_exists(_hb):
                     _hp = _load_json_retry(_hb)
                     if _hp:
                         try:
@@ -2879,7 +2891,7 @@ def watchdog_main(args: argparse.Namespace) -> None:
                         if worker_stall_seconds:
                             _hb = dirs["heartbeats"] / f"{slots[idx]['worker_id']}.json"
                             _ls = None
-                            if _hb.exists():
+                            if _safe_exists(_hb):
                                 _hp = _load_json_retry(_hb)
                                 if _hp:
                                     try:
@@ -2906,7 +2918,7 @@ def watchdog_main(args: argparse.Namespace) -> None:
                         exit_code = proc.exitcode
                         hb_note = ""
                         hb_path = dirs["heartbeats"] / f"{slots[idx]['worker_id']}.json"
-                        hb_payload = _load_json_retry(hb_path) if hb_path.exists() else None
+                        hb_payload = _load_json_retry(hb_path) if _safe_exists(hb_path) else None
                         if hb_payload:
                             last_seen = hb_payload.get("last_seen")
                             task_id = hb_payload.get("task_id")
