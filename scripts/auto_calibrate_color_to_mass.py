@@ -334,8 +334,58 @@ def _normalise_static_light_mode(mode: str | None) -> str:
         "intensity": "intensity",
         "luma": "intensity",
         "static-intensity": "intensity",
+        "spatial": "blue-spatial",
+        "spatial-gain": "blue-spatial",
+        "spatial-rgb": "blue-spatial",
+        "static-spatial": "blue-spatial",
+        "blue-spatial-gain": "blue-spatial",
+        "spatial-blue-gain": "blue-spatial",
+        "spatial-intensity": "intensity-spatial",
+        "intensity-spatial-gain": "intensity-spatial",
     }
     return aliases.get(value, value)
+
+
+def _smooth_static_gain_field(
+    raw_gain: np.ndarray,
+    mask: np.ndarray,
+    fallback_gain: np.ndarray,
+    sigma: float,
+    gain_low: float,
+    gain_high: float,
+) -> np.ndarray:
+    """Smooth sparse stable-region gains into a full low-resolution gain field."""
+
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        return np.broadcast_to(fallback_gain.reshape(1, 1, 3), raw_gain.shape).astype(np.float32)
+
+    field = np.empty_like(raw_gain, dtype=np.float32)
+    base_weight = mask.astype(np.float32)
+    for channel in range(3):
+        values = raw_gain[..., channel].astype(np.float32)
+        finite = np.isfinite(values)
+        weights = base_weight * finite.astype(np.float32)
+        if float(np.sum(weights)) <= 0:
+            field[..., channel] = float(fallback_gain[channel])
+            continue
+        numerator = gaussian_filter(np.where(finite, values, 0.0) * weights, sigma=sigma, mode="nearest")
+        denominator = gaussian_filter(weights, sigma=sigma, mode="nearest")
+        smoothed = np.where(denominator > 1e-6, numerator / denominator, float(fallback_gain[channel]))
+        field[..., channel] = np.clip(smoothed, gain_low, gain_high)
+    return field
+
+
+def _upsample_static_gain_field(field: np.ndarray, shape: tuple[int, int], stride: int) -> np.ndarray:
+    """Nearest-neighbour upsampling from stride-sampled grid to image shape."""
+
+    expanded = np.repeat(np.repeat(field, stride, axis=0), stride, axis=1)
+    pad_y = max(0, shape[0] - expanded.shape[0])
+    pad_x = max(0, shape[1] - expanded.shape[1])
+    if pad_y or pad_x:
+        expanded = np.pad(expanded, ((0, pad_y), (0, pad_x), (0, 0)), mode="edge")
+    return expanded[: shape[0], : shape[1], :]
 
 
 def _default_calibration_log_root() -> str:
@@ -362,10 +412,10 @@ def _apply_static_light_correction(
     correction = _normalise_static_light_mode(mode)
     if correction == "off" or len(loaded) < 2:
         return
-    if correction not in {"blue-gain", "intensity"}:
+    if correction not in {"blue-gain", "intensity", "blue-spatial", "intensity-spatial"}:
         raise ValueError(
             "Unknown static light correction mode "
-            f"{correction!r}; expected off, blue-gain, or intensity."
+            f"{correction!r}; expected off, blue-gain, intensity, blue-spatial, or intensity-spatial."
         )
 
     stride = max(4, int(os.environ.get("FFAC_STATIC_LIGHT_STRIDE", "16")))
@@ -374,6 +424,7 @@ def _apply_static_light_correction(
     clip_frac = float(os.environ.get("FFAC_STATIC_LIGHT_GAIN_CLIP", "0.15"))
     gain_low = max(0.01, 1.0 - abs(clip_frac))
     gain_high = 1.0 + abs(clip_frac)
+    spatial_sigma = float(os.environ.get("FFAC_STATIC_LIGHT_SPATIAL_SIGMA", "6.0"))
 
     samples: List[np.ndarray] = []
     for img, _injected, _t_h in loaded:
@@ -433,31 +484,74 @@ def _apply_static_light_correction(
     ref_rgb = med_rgb[0] if reference_mode == "first" else np.nanmedian(med_rgb, axis=0)
     ref_rgb = np.maximum(ref_rgb, 1e-6)
 
+    spatial_reference = None
+    if correction in {"blue-spatial", "intensity-spatial"}:
+        spatial_reference = stack[0] if reference_mode == "first" else np.nanmedian(stack, axis=0)
+        spatial_reference = np.maximum(spatial_reference.astype(np.float32), 1e-6)
+
     gains: List[np.ndarray] = []
+    field_ranges: List[Tuple[float, float]] = []
     for idx, (img, _injected, _t_h) in enumerate(loaded):
         cur_rgb = np.maximum(med_rgb[idx], 1e-6)
         if correction == "intensity":
             ref_luma = float(np.mean(ref_rgb))
             cur_luma = float(np.mean(cur_rgb))
             gain = np.array([ref_luma / max(cur_luma, 1e-6)] * 3, dtype=np.float32)
+        elif correction == "blue-gain":
+            gain = (ref_rgb / cur_rgb).astype(np.float32)
+        elif correction == "intensity-spatial":
+            assert spatial_reference is not None
+            cur_grid = np.maximum(stack[idx].astype(np.float32), 1e-6)
+            ref_luma_grid = np.mean(spatial_reference, axis=2)
+            cur_luma_grid = np.mean(cur_grid, axis=2)
+            raw_scalar = ref_luma_grid / np.maximum(cur_luma_grid, 1e-6)
+            raw_gain = np.repeat(raw_scalar[..., None], 3, axis=2)
+            ref_luma = float(np.mean(ref_rgb))
+            cur_luma = float(np.mean(cur_rgb))
+            gain = np.array([ref_luma / max(cur_luma, 1e-6)] * 3, dtype=np.float32)
         else:
+            assert spatial_reference is not None
+            cur_grid = np.maximum(stack[idx].astype(np.float32), 1e-6)
+            raw_gain = spatial_reference / cur_grid
             gain = (ref_rgb / cur_rgb).astype(np.float32)
         gain = np.clip(gain, gain_low, gain_high)
         arr = np.asarray(img.img, dtype=np.float32).copy()
-        arr[..., :3] = np.clip(arr[..., :3] * gain.reshape(1, 1, 3), 0.0, 1.0)
+        if correction in {"blue-spatial", "intensity-spatial"}:
+            raw_gain = np.clip(raw_gain.astype(np.float32), gain_low, gain_high)
+            field_small = _smooth_static_gain_field(
+                raw_gain,
+                mask,
+                gain.astype(np.float32),
+                spatial_sigma,
+                gain_low,
+                gain_high,
+            )
+            field = _upsample_static_gain_field(field_small, arr.shape[:2], stride)
+            arr[..., :3] = np.clip(arr[..., :3] * field, 0.0, 1.0)
+            field_ranges.append((float(np.nanmin(field)), float(np.nanmax(field))))
+        else:
+            arr[..., :3] = np.clip(arr[..., :3] * gain.reshape(1, 1, 3), 0.0, 1.0)
         img.img = arr
         gains.append(gain)
 
     gain_arr = np.stack(gains, axis=0)
+    field_note = ""
+    if field_ranges:
+        field_note = (
+            f" field_min={min(v[0] for v in field_ranges):.4f}"
+            f" field_max={max(v[1] for v in field_ranges):.4f}"
+            f" spatial_sigma={spatial_sigma:.2f}"
+        )
     logger.info(
         "[%s] static light correction mode=%s samples=%d stride=%d "
-        "gain_min=%s gain_max=%s",
+        "gain_min=%s gain_max=%s%s",
         run,
         correction,
         int(ys.size),
         stride,
         np.round(gain_arr.min(axis=0), 4).tolist(),
         np.round(gain_arr.max(axis=0), 4).tolist(),
+        field_note,
     )
 
 
