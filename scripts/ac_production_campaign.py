@@ -221,6 +221,8 @@ def _common_master_args(args: argparse.Namespace, variant: Variant, queue: str, 
             "--warmup-iters",
             str(args.warmup_iters),
             "--run-mode parallel",
+            "--max-active-runs",
+            str(args.max_active_runs),
             "--max-in-flight-per-run",
             str(args.max_in_flight_per_run),
             "--control-dir",
@@ -231,7 +233,11 @@ def _common_master_args(args: argparse.Namespace, variant: Variant, queue: str, 
             "--quality-dtype float32",
         ]
     )
-    if args.no_clear_queue:
+    if args.exact_logs_dir:
+        command.append("--exact-logs-dir")
+    if args.use_history:
+        command.extend(["--use-history", "true"])
+    if args.no_clear_queue or args.resume_existing:
         command.append("--no-clear-queue")
     return command
 
@@ -263,6 +269,9 @@ def commands(args: argparse.Namespace) -> None:
     queue_root = args.queue_root.rstrip("\\/")
     logs_root = args.logs_root.rstrip("\\/")
     control_root = args.control_root.rstrip("\\/") if args.control_root else queue_root
+    if args.resume_existing:
+        args.exact_logs_dir = True
+        args.use_history = True
 
     print("# AC production calibration campaign.")
     print(f"# Run set: {args.run_set} ({run_count} runs).")
@@ -276,16 +285,26 @@ def commands(args: argparse.Namespace) -> None:
     for variant in selected:
         queue = f"{queue_root}_{variant.name}"
         logs_dir = f"{logs_root}\\{variant.name}"
+        if args.resume_existing:
+            variant_log_root = Path(logs_dir)
+            existing = [
+                path for path in variant_log_root.glob("*")
+                if path.is_dir() and (path / "commands.txt").exists()
+            ] if variant_log_root.exists() else []
+            if existing:
+                logs_dir = str(max(existing, key=lambda path: path.stat().st_mtime))
         control = f"{control_root}_{variant.name}\\control"
         print(f"# --- {variant.name}: {variant.note} ---")
         print("# master terminal:")
         for line in _env_lines(variant, args.spatial_sigma):
             print(line)
+        print("$env:FFAC_MASTER_LIGHT_CONTEXT = 'on'")
         print(" ".join(_common_master_args(args, variant, queue, logs_dir, control)))
         print()
         print("# watchdog terminal on each machine:")
         for line in _env_lines(variant, args.spatial_sigma):
             print(line)
+        print("Remove-Item Env:\\FFAC_MASTER_LIGHT_CONTEXT -ErrorAction SilentlyContinue")
         print(" ".join(_watchdog_args(args, variant, queue, control)))
         print()
 
@@ -308,7 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--logs-root", default=r"Z:\Albus\Autokalibrering_log\holiday_2026")
     cmd.add_argument("--max-iters", type=int, default=800)
     cmd.add_argument("--warmup-iters", type=int, default=150)
-    cmd.add_argument("--max-in-flight-per-run", type=int, default=3)
+    cmd.add_argument("--max-active-runs", type=int, default=3)
+    cmd.add_argument("--max-in-flight-per-run", type=int, default=2)
     cmd.add_argument(
         "--workers",
         type=int,
@@ -318,6 +338,13 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--sanity-every", type=int, default=100)
     cmd.add_argument("--spatial-sigma", type=float, default=6.0)
     cmd.add_argument("--max-tasks-per-worker", type=int, default=80)
+    cmd.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="Restart against the latest existing timestamped log folder per variant.",
+    )
+    cmd.add_argument("--exact-logs-dir", action="store_true")
+    cmd.add_argument("--use-history", action="store_true")
     cmd.add_argument("--save-calibration", action="store_true")
     cmd.add_argument("--no-clear-queue", action="store_true")
     cmd.set_defaults(func=commands)

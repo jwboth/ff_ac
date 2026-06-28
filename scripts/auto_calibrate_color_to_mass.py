@@ -816,32 +816,44 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                 return cands[0][2]
         return None  # no usable neighbour within window -> drop this calibration point
 
-    for p in ctx_raw.image_paths:
-        img = _select_frame(p)
-        if img is None:
-            logger.warning(
-                "[%s] calibration frame %s uncorrectable and no good neighbour within "
-                "window; dropping this calibration point.", run, Path(p).name)
-            continue
-        # Memory-bandwidth reduction for worker evaluations (the master always builds
-        # with quality_dtype=None -> full float64, so the saved/finalised calibration
-        # stays full-scale). A float32 cast halves the bytes streamed per array op in
-        # the colour->signal->flash->mass pipeline; the integral itself is summed in
-        # float64 inside geometry.integrate, so accuracy is preserved.
-        if quality_dtype:
+    light_master = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if light_master:
+        logger.info(
+            "[%s] FFAC_MASTER_LIGHT_CONTEXT=on -> skipping calibration image preload",
+            run,
+        )
+    else:
+        for p in ctx_raw.image_paths:
+            img = _select_frame(p)
+            if img is None:
+                logger.warning(
+                    "[%s] calibration frame %s uncorrectable and no good neighbour within "
+                    "window; dropping this calibration point.", run, Path(p).name)
+                continue
+            # Memory-bandwidth reduction for worker evaluations (the master always builds
+            # with quality_dtype=None -> full float64, so the saved/finalised calibration
+            # stays full-scale). A float32 cast halves the bytes streamed per array op in
+            # the colour->signal->flash->mass pipeline; the integral itself is summed in
+            # float64 inside geometry.integrate, so accuracy is preserved.
+            if quality_dtype:
+                try:
+                    img.img = np.asarray(img.img, dtype=np.dtype(quality_dtype))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[%s] quality_dtype=%s cast failed: %s", run, quality_dtype, exc)
+            injected = float(experiment.injection_protocol.injected_mass(date=img.date))
             try:
-                img.img = np.asarray(img.img, dtype=np.dtype(quality_dtype))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[%s] quality_dtype=%s cast failed: %s", run, quality_dtype, exc)
-        injected = float(experiment.injection_protocol.injected_mass(date=img.date))
-        try:
-            t_h = (img.date - exp_start).total_seconds() / 3600.0
-        except Exception:
-            t_h = float(len(loaded))
-        loaded.append((img, injected, t_h))
-    _apply_static_light_correction(loaded, mode=static_light_correction, run=run)
-    logger.info("[%s] preloaded %d calibration image(s); active labels=%s",
-                run, len(loaded), signal_labels)
+                t_h = (img.date - exp_start).total_seconds() / 3600.0
+            except Exception:
+                t_h = float(len(loaded))
+            loaded.append((img, injected, t_h))
+        _apply_static_light_correction(loaded, mode=static_light_correction, run=run)
+        logger.info("[%s] preloaded %d calibration image(s); active labels=%s",
+                    run, len(loaded), signal_labels)
 
     # ---- optional spatial downscale (workers only; master uses quality_scale=1.0) ----
     # Ported from ff_um's _apply_quality_to_rig. Use darsia.resize (which updates the
@@ -1040,6 +1052,14 @@ _EVAL_TB_PRINTED = False
 
 def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalResult:
     import numpy as np
+    if not context._loaded:
+        return EvalResult(
+            objective=PENALTY_VALUE,
+            feasible=False,
+            metrics={},
+            status="no-calibration-images",
+            params=params,
+        )
     apply_params(context.calibration, params, labels=context.signal_labels, np_module=np)
     total_err = 0.0
     feasible = True

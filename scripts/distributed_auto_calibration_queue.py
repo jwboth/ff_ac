@@ -1088,9 +1088,32 @@ def _task_payload(
     return payload
 
 
-def _pick_run_order(runs: Sequence[str], run_mode: str, current: Optional[str]) -> List[str]:
+def _pick_run_order(
+    runs: Sequence[str],
+    run_mode: str,
+    current: Optional[str],
+    run_states: Optional[Mapping[str, RunState]] = None,
+    max_active_runs: int = 0,
+) -> List[str]:
     if run_mode == "serial":
         return [current] if current else []
+    if max_active_runs > 0 and run_states is not None:
+        active = [
+            run for run in runs
+            if run in run_states and getattr(run_states[run], "phase", None) != "done"
+        ]
+        for run in runs:
+            if len(active) >= max_active_runs:
+                break
+            state = run_states.get(run)
+            if state is not None:
+                if getattr(state, "phase", None) == "done":
+                    continue
+                if run not in active:
+                    active.append(run)
+                continue
+            active.append(run)
+        return active
     return list(runs)
 
 
@@ -1504,6 +1527,7 @@ def master_main(args: argparse.Namespace) -> None:
         "run_mode": args.run_mode,
         "max_in_flight": args.max_in_flight,
         "max_in_flight_per_run": args.max_in_flight_per_run,
+        "max_active_runs": getattr(args, "max_active_runs", 0),
         "max_retries": args.max_retries,
         "task_timeout_minutes": args.task_timeout_minutes,
         "heartbeat_timeout_seconds": args.heartbeat_timeout_seconds,
@@ -2080,7 +2104,13 @@ def master_main(args: argparse.Namespace) -> None:
                 _log_master(f"reaped orphan in_progress {_ip_path.name} (untracked)")
 
         # Enqueue tasks
-        active_runs = _pick_run_order(runs, args.run_mode, active_run)
+        active_runs = _pick_run_order(
+            runs,
+            args.run_mode,
+            active_run,
+            run_states,
+            max(0, int(getattr(args, "max_active_runs", 0) or 0)),
+        )
         for run in active_runs:
             state = run_states.get(run)
             if state is None:
@@ -3104,6 +3134,12 @@ def build_parser() -> argparse.ArgumentParser:
     master.add_argument("--run-mode", choices=["serial", "parallel"], default="serial")
     master.add_argument("--max-in-flight", type=int, default=0)
     master.add_argument("--max-in-flight-per-run", type=int, default=0)
+    master.add_argument(
+        "--max-active-runs",
+        type=int,
+        default=0,
+        help="With --run-mode parallel, limit how many runs are active/kept in memory at once (0=all).",
+    )
     master.add_argument(
         "--control-dir",
         default=None,
