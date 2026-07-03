@@ -555,6 +555,240 @@ def _apply_static_light_correction(
     )
 
 
+def _template_registration_target() -> str:
+    value = os.environ.get("FFAC_TEMPLATE_REGISTRATION", "").strip().lower()
+    if value in {"", "0", "false", "no", "none", "off"}:
+        return ""
+    return value
+
+
+def _registration_baseline_array(path: Path) -> np.ndarray:
+    data = np.load(path, allow_pickle=True)
+    if "array" in data:
+        arr = data["array"]
+    elif "img" in data:
+        arr = data["img"]
+    else:
+        raise KeyError(f"{path} does not contain an image array")
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    return arr[..., :3]
+
+
+def _registration_gray(arr: np.ndarray, *, max_col: int, scale: float) -> np.ndarray:
+    import cv2
+
+    cropped = arr[:, : min(max_col, arr.shape[1]), :3]
+    cropped = np.clip(cropped, 0.0, 1.0)
+    gray = cv2.cvtColor((cropped * 255.0).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    if scale != 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return cv2.equalizeHist(gray)
+
+
+def _estimate_template_affine(
+    src: np.ndarray,
+    dst: np.ndarray,
+    *,
+    mode: str,
+    scale: float,
+    max_col: int,
+    max_features: int,
+    keep_matches: int,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Estimate source->template registration from baseline images.
+
+    The default mode is a partial affine transform, i.e. translation + rotation +
+    uniform scale. This is intentionally less flexible than a homography so the
+    mass integral is not changed by arbitrary perspective/shear deformation.
+    """
+
+    import cv2
+    import math
+
+    src_gray = _registration_gray(src, max_col=max_col, scale=scale)
+    dst_gray = _registration_gray(dst, max_col=max_col, scale=scale)
+
+    detector = cv2.ORB_create(nfeatures=max_features, fastThreshold=8)
+    kp_src, des_src = detector.detectAndCompute(src_gray, None)
+    kp_dst, des_dst = detector.detectAndCompute(dst_gray, None)
+    if des_src is None or des_dst is None or len(kp_src) < 10 or len(kp_dst) < 10:
+        raise RuntimeError("too few registration features")
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = sorted(matcher.match(des_src, des_dst), key=lambda m: m.distance)
+    matches = matches[: max(10, keep_matches)]
+    src_pts = np.float32([kp_src[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_dst[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    mode = mode.strip().lower().replace("-", "_")
+    if mode in {"similarity", "partial", "partial_affine", "affine"}:
+        mat, inliers = cv2.estimateAffinePartial2D(
+            src_pts,
+            dst_pts,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=5000,
+            confidence=0.995,
+        )
+        if mat is None:
+            raise RuntimeError("partial affine registration failed")
+        mat = mat.astype(np.float32)
+        mat[:, 2] /= float(scale)
+        a, b, tx = [float(x) for x in mat[0]]
+        c, d, ty = [float(x) for x in mat[1]]
+        reg_scale = math.sqrt(a * a + c * c)
+        angle = math.degrees(math.atan2(c, a))
+        inlier_count = int(inliers.sum()) if inliers is not None else 0
+        return mat, {
+            "matches": float(len(matches)),
+            "inliers": float(inlier_count),
+            "dx_px": tx,
+            "dy_px": ty,
+            "scale": reg_scale,
+            "angle_deg": angle,
+        }
+    if mode == "translation":
+        # Use partial affine for robust matching, then keep only the translation.
+        mat, stats = _estimate_template_affine(
+            src,
+            dst,
+            mode="partial_affine",
+            scale=scale,
+            max_col=max_col,
+            max_features=max_features,
+            keep_matches=keep_matches,
+        )
+        out = np.array([[1.0, 0.0, mat[0, 2]], [0.0, 1.0, mat[1, 2]]], dtype=np.float32)
+        stats["scale"] = 1.0
+        stats["angle_deg"] = 0.0
+        return out, stats
+    if mode == "homography":
+        hom, inliers = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC)
+        if hom is None:
+            raise RuntimeError("homography registration failed")
+        s = float(scale)
+        to_small = np.diag([s, s, 1.0])
+        to_full = np.diag([1.0 / s, 1.0 / s, 1.0])
+        hom_full = (to_full @ hom @ to_small).astype(np.float32)
+        inlier_count = int(inliers.sum()) if inliers is not None else 0
+        return hom_full, {
+            "matches": float(len(matches)),
+            "inliers": float(inlier_count),
+            "dx_px": float(hom_full[0, 2]),
+            "dy_px": float(hom_full[1, 2]),
+            "scale": float(np.sqrt(abs(np.linalg.det(hom_full[:2, :2])))),
+            "angle_deg": float("nan"),
+        }
+    raise ValueError(
+        f"Unknown FFAC_TEMPLATE_REGISTRATION_MODE={mode!r}; expected partial_affine, translation, or homography."
+    )
+
+
+def _warp_registration_image(img: Any, transform: np.ndarray, *, mode: str) -> Any:
+    import cv2
+
+    arr = np.asarray(img.img)
+    height, width = arr.shape[:2]
+    if mode.strip().lower().replace("-", "_") == "homography":
+        warped = cv2.warpPerspective(
+            arr,
+            transform,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+    else:
+        warped = cv2.warpAffine(
+            arr,
+            transform,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+    img.img = warped.astype(arr.dtype, copy=False)
+    return img
+
+
+def _setup_template_registration(
+    *,
+    run: str,
+    config: Any,
+    fluidflower: Any,
+    calibration: Any,
+) -> Tuple[Optional[np.ndarray], str]:
+    template_run = _template_registration_target()
+    if not template_run or template_run == run.lower():
+        return None, "off"
+
+    mode = os.environ.get("FFAC_TEMPLATE_REGISTRATION_MODE", "partial_affine")
+    scale = float(os.environ.get("FFAC_TEMPLATE_REGISTRATION_SCALE", "0.25"))
+    max_col = int(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MAX_COL", "4800"))
+    max_features = int(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MAX_FEATURES", "12000"))
+    keep_matches = int(os.environ.get("FFAC_TEMPLATE_REGISTRATION_KEEP_MATCHES", "800"))
+    min_inlier_frac = float(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MIN_INLIER_FRAC", "0.50"))
+    max_abs_shift = float(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MAX_SHIFT_PX", "500"))
+    min_scale = float(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MIN_SCALE", "0.90"))
+    max_scale = float(os.environ.get("FFAC_TEMPLATE_REGISTRATION_MAX_SCALE", "1.10"))
+
+    try:
+        results_dir = Path(getattr(getattr(config, "data", None), "results"))
+        template_dir = results_dir.parent / template_run
+        template_path = template_dir / "setup" / "rig" / "shape_corrected_baseline.npz"
+        if not template_path.exists():
+            raise FileNotFoundError(template_path)
+        src = np.asarray(getattr(fluidflower, "shape_corrected_baseline").img, dtype=np.float32)[..., :3]
+        dst = _registration_baseline_array(template_path)
+        transform, stats = _estimate_template_affine(
+            src,
+            dst,
+            mode=mode,
+            scale=scale,
+            max_col=max_col,
+            max_features=max_features,
+            keep_matches=keep_matches,
+        )
+        inlier_frac = stats["inliers"] / max(stats["matches"], 1.0)
+        if inlier_frac < min_inlier_frac:
+            raise RuntimeError(f"low inlier fraction {inlier_frac:.3f}")
+        if abs(stats["dx_px"]) > max_abs_shift or abs(stats["dy_px"]) > max_abs_shift:
+            raise RuntimeError(f"large shift dx={stats['dx_px']:.1f}, dy={stats['dy_px']:.1f}")
+        if mode.strip().lower().replace("-", "_") != "homography":
+            if not (min_scale <= stats["scale"] <= max_scale):
+                raise RuntimeError(f"scale {stats['scale']:.5f} outside [{min_scale}, {max_scale}]")
+
+        color_base = getattr(getattr(calibration, "color_analysis", None), "base", None)
+        if color_base is not None:
+            _warp_registration_image(color_base, transform, mode=mode)
+
+        logger.info(
+            "[%s] template registration ACTIVE target=%s mode=%s "
+            "matches=%d inliers=%d frac=%.3f dx=%.1f dy=%.1f scale=%.5f angle=%.3f",
+            run,
+            template_run,
+            mode,
+            int(stats["matches"]),
+            int(stats["inliers"]),
+            inlier_frac,
+            stats["dx_px"],
+            stats["dy_px"],
+            stats["scale"],
+            stats["angle_deg"],
+        )
+        return transform, mode
+    except Exception as exc:  # noqa: BLE001
+        if os.environ.get("FFAC_TEMPLATE_REGISTRATION_STRICT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise
+        logger.warning("[%s] template registration requested but skipped: %s", run, exc)
+        return None, "off"
+
+
 def write_history_csv(path: Path, history: Sequence[Dict[str, Any]]) -> None:  # type: ignore
     rows = list(history or [])
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -759,6 +993,22 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             all_labels = [int(x) for x in np.unique(labels_img) if x >= 0]
     signal_labels = [l for l in all_labels if l not in ignore and l != 0]
 
+    light_master = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if light_master:
+        template_registration, template_registration_mode = None, "off"
+    else:
+        template_registration, template_registration_mode = _setup_template_registration(
+            run=run,
+            config=config,
+            fluidflower=fluidflower,
+            calibration=cta,
+        )
+
     # preload corrected calibration images + (param-independent) injected mass
     loaded: List[Tuple[Any, float, float]] = []
     exp_start = getattr(experiment, "experiment_start", None)
@@ -773,6 +1023,12 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
     # behaves exactly as a plain read (no neighbour I/O, current behaviour unchanged).
     def _read_and_flag(path):
         im = fluidflower.read_image(Path(path))
+        if template_registration is not None:
+            im = _warp_registration_image(
+                im,
+                template_registration,
+                mode=template_registration_mode,
+            )
         flagged = any(
             getattr(_cc, "active", False) and getattr(_cc, "last_flagged", False)
             for _cc in (getattr(fluidflower, "color_corrections", None) or [])
@@ -816,12 +1072,6 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                 return cands[0][2]
         return None  # no usable neighbour within window -> drop this calibration point
 
-    light_master = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
     if light_master:
         logger.info(
             "[%s] FFAC_MASTER_LIGHT_CONTEXT=on -> skipping calibration image preload",
