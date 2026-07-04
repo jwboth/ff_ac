@@ -1158,32 +1158,51 @@ def _finalize_run(
         return
     if run_state.baseline_eval and run_state.baseline_eval.objective <= run_state.best_eval.objective:
         return
-    # Re-evaluate the best parameters at FULL scale on the master context (which is
-    # always built without quality downscaling/dtype-cast), so the final, persisted
-    # calibration is validated and logged at full resolution regardless of whatever
-    # reduced quality the workers used during the search.
+    # Re-evaluate the best parameters at FULL scale on the master context when
+    # possible. In light-master mode the context intentionally has no preloaded
+    # images, so evaluation returns the penalty value with empty metrics. In that
+    # case, keep the worker-evaluated best row instead of writing a misleading
+    # empty final file.
     if run_state.best_params and run_state.context is not None:
+        final_payload = None
         try:
             full_eval = evaluate_run(run_state.context, run_state.best_params)
+            if getattr(full_eval, "metrics", None):
+                final_payload = {
+                    "run": run_state.run,
+                    "objective_full_scale": full_eval.objective,
+                    "metrics": {k: vars(v) for k, v in full_eval.metrics.items()},
+                    "params": run_state.best_params,
+                    "source": "master_full_scale",
+                }
+        except Exception as exc:  # noqa: BLE001
+            print(f"[master] [{run_state.run}] full-scale finalise eval failed: {exc!r}", flush=True)
+        if final_payload is None and chosen:
+            metrics = chosen.get("metrics")
+            if isinstance(metrics, dict) and metrics:
+                final_payload = {
+                    "run": run_state.run,
+                    "objective_full_scale": chosen.get("objective", PENALTY_VALUE),
+                    "metrics": metrics,
+                    "params": run_state.best_params,
+                    "source": "best_worker_row_fallback",
+                }
+        if final_payload is not None:
             (logs_dir / f"final_full_scale_{run_state.run}.json").write_text(
-                json.dumps(
-                    {
-                        "run": run_state.run,
-                        "objective_full_scale": full_eval.objective,
-                        "metrics": {k: vars(v) for k, v in full_eval.metrics.items()},
-                        "params": run_state.best_params,
-                    },
-                    default=str,
-                    indent=2,
-                ),
+                json.dumps(final_payload, default=str, indent=2),
                 encoding="utf-8",
             )
             print(
-                f"[master] [{run_state.run}] full-scale finalise objective={full_eval.objective:.6f}",
+                f"[master] [{run_state.run}] finalise objective="
+                f"{float(final_payload['objective_full_scale']):.6f} "
+                f"source={final_payload['source']}",
                 flush=True,
             )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[master] [{run_state.run}] full-scale finalise eval failed: {exc!r}", flush=True)
+        else:
+            print(
+                f"[master] [{run_state.run}] finalise skipped: no non-empty metrics available",
+                flush=True,
+            )
     if save_calibration:
         save_best_calibration(run_state.context, run_state.best_params, out_folder)
     elif run_state.best_params:

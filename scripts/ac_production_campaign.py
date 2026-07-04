@@ -92,6 +92,7 @@ class Variant:
     bounds_file: str = "config/bounds_seg6_titration.json"
     titration: bool = True
     template_registration: str = "off"
+    template_mode: str = "partial_affine"
     note: str = ""
 
 
@@ -161,6 +162,15 @@ VARIANTS = [
         note="coupled baseline plus image/template registration into AC60 coordinates",
     ),
     Variant(
+        "coupled_template_ac60_translation_l1",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_coupled.json",
+        template_registration="ac60",
+        template_mode="translation",
+        note="coupled baseline plus translation-only registration into AC60 coordinates",
+    ),
+    Variant(
         "titration_static_spatial_l1",
         "off",
         "blue-spatial",
@@ -206,6 +216,11 @@ VARIANT_SETS = {
     "template_test": [
         "coupled_baseline_l1",
         "coupled_template_ac60_l1",
+    ],
+    "geometry_diagnostic": [
+        "coupled_baseline_l1",
+        "coupled_template_ac60_l1",
+        "coupled_template_ac60_translation_l1",
     ],
     "holiday4": [
         "titration_static_spatial_l1",
@@ -295,7 +310,7 @@ def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
         lines.append("Remove-Item Env:\\FFAC_STATIC_LIGHT_SPATIAL_SIGMA -ErrorAction SilentlyContinue")
     if variant.template_registration != "off":
         lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION = '{variant.template_registration}'")
-        lines.append("$env:FFAC_TEMPLATE_REGISTRATION_MODE = 'partial_affine'")
+        lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION_MODE = '{variant.template_mode}'")
     else:
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION -ErrorAction SilentlyContinue")
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_MODE -ErrorAction SilentlyContinue")
@@ -457,7 +472,7 @@ def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, sp
         env.pop("FFAC_STATIC_LIGHT_SPATIAL_SIGMA", None)
     if variant.template_registration != "off":
         env["FFAC_TEMPLATE_REGISTRATION"] = variant.template_registration
-        env["FFAC_TEMPLATE_REGISTRATION_MODE"] = "partial_affine"
+        env["FFAC_TEMPLATE_REGISTRATION_MODE"] = variant.template_mode
     else:
         env.pop("FFAC_TEMPLATE_REGISTRATION", None)
         env.pop("FFAC_TEMPLATE_REGISTRATION_MODE", None)
