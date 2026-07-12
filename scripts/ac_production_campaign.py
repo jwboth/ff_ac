@@ -84,6 +84,22 @@ HARDCASE_RUNS = [
 ]
 
 
+SCREEN_STEP1_RUNS = [
+    # Final-method screening: hard cases plus controls.
+    "ac20",  # early good-control run
+    "ac24",
+    "ac25",
+    "ac26",
+    "ac29",
+    "ac40",
+    "ac44",
+    "ac51",
+    "ac52",
+    "ac53",  # AC53 testbed / good-control run
+    "ac60",  # template-era good-control run
+]
+
+
 @dataclass(frozen=True)
 class Variant:
     name: str
@@ -93,10 +109,17 @@ class Variant:
     titration: bool = True
     template_registration: str = "off"
     template_mode: str = "partial_affine"
+    static_reference: str = "median"
     note: str = ""
 
 
 VARIANTS = [
+    Variant(
+        "production_titration_l1",
+        "off",
+        "off",
+        note="current production titration control, no extra static light or template registration",
+    ),
     Variant(
         "coupled_baseline_l1",
         "off",
@@ -177,6 +200,28 @@ VARIANTS = [
         note="titration with spatial static FluidFlower light gain",
     ),
     Variant(
+        "titration_firstframe_spatial_l1",
+        "off",
+        "blue-spatial",
+        static_reference="first",
+        note="titration with spatial light gain referenced to the first calibration frame",
+    ),
+    Variant(
+        "titration_template_ac14_l1",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        note="titration plus partial-affine registration into AC14/segmentation-template coordinates",
+    ),
+    Variant(
+        "titration_template_ac14_firstframe_spatial_l1",
+        "off",
+        "blue-spatial",
+        template_registration="ac14_template",
+        static_reference="first",
+        note="AC14 template registration plus first-frame spatial light reference",
+    ),
+    Variant(
         "titration_static_spatial_drift025",
         "drift:0.25",
         "blue-spatial",
@@ -244,6 +289,12 @@ VARIANT_SETS = {
         "titration_static_global_l1",
         "titration_static_global_drift025",
     ],
+    "screen_step1": [
+        "production_titration_l1",
+        "titration_firstframe_spatial_l1",
+        "titration_template_ac14_l1",
+        "titration_template_ac14_firstframe_spatial_l1",
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -286,6 +337,8 @@ def _select_runs(run_set: str) -> list[str]:
         return ROLLOUT_RUNS
     if run_set == "hardcases":
         return HARDCASE_RUNS
+    if run_set == "screen_step1":
+        return SCREEN_STEP1_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
@@ -308,6 +361,10 @@ def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
         lines.append(f"$env:FFAC_STATIC_LIGHT_SPATIAL_SIGMA = '{spatial_sigma:g}'")
     else:
         lines.append("Remove-Item Env:\\FFAC_STATIC_LIGHT_SPATIAL_SIGMA -ErrorAction SilentlyContinue")
+    if variant.static_reference != "median":
+        lines.append(f"$env:FFAC_STATIC_LIGHT_REFERENCE = '{variant.static_reference}'")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_STATIC_LIGHT_REFERENCE -ErrorAction SilentlyContinue")
     if variant.template_registration != "off":
         lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION = '{variant.template_registration}'")
         lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION_MODE = '{variant.template_mode}'")
@@ -470,6 +527,10 @@ def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, sp
         env["FFAC_STATIC_LIGHT_SPATIAL_SIGMA"] = f"{spatial_sigma:g}"
     else:
         env.pop("FFAC_STATIC_LIGHT_SPATIAL_SIGMA", None)
+    if variant.static_reference != "median":
+        env["FFAC_STATIC_LIGHT_REFERENCE"] = variant.static_reference
+    else:
+        env.pop("FFAC_STATIC_LIGHT_REFERENCE", None)
     if variant.template_registration != "off":
         env["FFAC_TEMPLATE_REGISTRATION"] = variant.template_registration
         env["FFAC_TEMPLATE_REGISTRATION_MODE"] = variant.template_mode
@@ -598,11 +659,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     cmd = sub.add_parser("commands", help="Emit PowerShell master/watchdog commands.")
-    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, holiday4, holiday5, spatial, global, or all.")
+    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, screen_step1, holiday4, holiday5, spatial, global, or all.")
     cmd.add_argument(
         "--run-set",
         default="all",
-        help="production, rollout, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     cmd.add_argument("--repo", default=".")
     cmd.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
@@ -634,11 +695,11 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.set_defaults(func=commands)
 
     launcher = sub.add_parser("launch", help="Start production/hardcase campaign processes in background.")
-    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, hardcase8, holiday4, holiday5, spatial, global, or all.")
+    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
     launcher.add_argument(
         "--run-set",
         default="hardcases",
-        help="production, rollout, hardcases, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, hardcases, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     launcher.add_argument(
         "--role",
