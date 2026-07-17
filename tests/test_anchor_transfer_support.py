@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from scripts.auto_calibrate_color_to_mass import (
     _compute_anchor_photometric_gain,
     _porous_baseline_median,
+    sample_params,
 )
 from scripts.distributed_auto_calibration_queue import (
     _clear_master_complete,
@@ -17,7 +19,17 @@ from scripts.distributed_auto_calibration_queue import (
     _mark_master_complete,
     _queue_is_complete,
     _worker_context_is_idle,
+    _derived_run_seed,
     watchdog_main,
+    build_parser as build_queue_parser,
+)
+from scripts.ac_production_campaign import (
+    FINAL_GEOMETRY_RUNS,
+    _common_master_args,
+    _select_runs,
+    _select_variants,
+    _watchdog_args,
+    build_parser as build_campaign_parser,
 )
 
 
@@ -129,3 +141,66 @@ def test_watchdog_does_not_spawn_workers_for_completed_queue(tmp_path):
     state = json.loads(states[0].read_text())
     assert state["desired_workers"] == 0
     assert state["workers_running"] == 0
+
+
+def test_queue_master_accepts_optuna_seed():
+    args = build_queue_parser().parse_args(
+        [
+            "master",
+            "--queue",
+            "queue",
+            "--runs",
+            "ac20",
+            "--optuna-seed",
+            "73",
+        ]
+    )
+    assert args.optuna_seed == 73
+
+
+def test_paired_seed_is_stable_per_run_and_controls_random_warmups():
+    ac20_seed = _derived_run_seed(17, "ac20")
+    assert ac20_seed == _derived_run_seed(17, "AC20")
+    assert ac20_seed != _derived_run_seed(17, "ac24")
+    assert ac20_seed != _derived_run_seed(73, "ac20")
+
+    first = sample_params(PARAM_SPACE, rng=random.Random(ac20_seed))
+    second = sample_params(PARAM_SPACE, rng=random.Random(ac20_seed))
+    assert first == second
+
+
+def test_final_geometry_campaign_is_paired_and_memory_bounded():
+    variants = _select_variants("final_geometry")
+    assert _select_runs("final_geometry") == FINAL_GEOMETRY_RUNS
+    assert [(variant.template_registration, variant.optuna_seed) for variant in variants] == [
+        ("off", 17),
+        ("ac14_template", 17),
+        ("off", 73),
+        ("ac14_template", 73),
+    ]
+    assert [variant.template_strict for variant in variants] == [False, True, False, True]
+
+    args = build_campaign_parser().parse_args(
+        [
+            "launch",
+            "--variant",
+            "final_geometry",
+            "--run-set",
+            "final_geometry",
+            "--max-active-runs",
+            "2",
+            "--max-in-flight-per-run",
+            "3",
+            "--idle-exit-seconds",
+            "120",
+            "--threads-per-worker",
+            "1",
+        ]
+    )
+    master = _common_master_args(args, variants[0], "queue", "logs", "control")
+    watchdog = _watchdog_args(args, variants[0], "queue", "control", workers=3)
+    assert master[master.index("--optuna-seed") + 1] == "17"
+    assert master[master.index("--max-active-runs") + 1] == "2"
+    assert master[master.index("--max-in-flight-per-run") + 1] == "3"
+    assert watchdog[watchdog.index("--idle-exit-seconds") + 1] == "120.0"
+    assert watchdog[watchdog.index("--threads-per-worker") + 1] == "1"

@@ -100,6 +100,17 @@ SCREEN_STEP1_RUNS = [
 ]
 
 
+FINAL_GEOMETRY_RUNS = [
+    # Full-budget convergence comparison: controls, slow convergence, and hard cases.
+    "ac20",
+    "ac24",
+    "ac40",
+    "ac44",
+    "ac52",
+    "ac60",
+]
+
+
 @dataclass(frozen=True)
 class Variant:
     name: str
@@ -109,7 +120,9 @@ class Variant:
     titration: bool = True
     template_registration: str = "off"
     template_mode: str = "partial_affine"
+    template_strict: bool = False
     static_reference: str = "median"
+    optuna_seed: int | None = None
     note: str = ""
 
 
@@ -222,6 +235,38 @@ VARIANTS = [
         note="AC14 template registration plus first-frame spatial light reference",
     ),
     Variant(
+        "final_baseline_seed17",
+        "off",
+        "off",
+        optuna_seed=17,
+        note="full-budget production titration baseline, paired Optuna seed 17",
+    ),
+    Variant(
+        "final_template_ac14_seed17",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        note="full-budget AC14 template registration, paired Optuna seed 17",
+    ),
+    Variant(
+        "final_baseline_seed73",
+        "off",
+        "off",
+        optuna_seed=73,
+        note="full-budget production titration baseline, paired Optuna seed 73",
+    ),
+    Variant(
+        "final_template_ac14_seed73",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=73,
+        note="full-budget AC14 template registration, paired Optuna seed 73",
+    ),
+    Variant(
         "titration_static_spatial_drift025",
         "drift:0.25",
         "blue-spatial",
@@ -295,6 +340,12 @@ VARIANT_SETS = {
         "titration_template_ac14_l1",
         "titration_template_ac14_firstframe_spatial_l1",
     ],
+    "final_geometry": [
+        "final_baseline_seed17",
+        "final_template_ac14_seed17",
+        "final_baseline_seed73",
+        "final_template_ac14_seed73",
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -339,6 +390,8 @@ def _select_runs(run_set: str) -> list[str]:
         return HARDCASE_RUNS
     if run_set == "screen_step1":
         return SCREEN_STEP1_RUNS
+    if run_set == "final_geometry":
+        return FINAL_GEOMETRY_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
@@ -368,9 +421,14 @@ def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
     if variant.template_registration != "off":
         lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION = '{variant.template_registration}'")
         lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION_MODE = '{variant.template_mode}'")
+        if variant.template_strict:
+            lines.append("$env:FFAC_TEMPLATE_REGISTRATION_STRICT = 'on'")
+        else:
+            lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_STRICT -ErrorAction SilentlyContinue")
     else:
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION -ErrorAction SilentlyContinue")
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_MODE -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_STRICT -ErrorAction SilentlyContinue")
     return lines
 
 
@@ -395,6 +453,8 @@ def _common_master_args(args: argparse.Namespace, variant: Variant, queue: str, 
     ]
     if not args.save_calibration:
         command.append("--no-save-calibration")
+    if variant.optuna_seed is not None:
+        command.extend(["--optuna-seed", str(variant.optuna_seed)])
     command.extend(
         [
             "--max-iters",
@@ -444,6 +504,10 @@ def _watchdog_args(
         "--workers",
         str(worker_count),
         "--worker-stall-seconds 600",
+        "--idle-exit-seconds",
+        str(args.idle_exit_seconds),
+        "--threads-per-worker",
+        str(args.threads_per_worker),
     ]
     if args.max_tasks_per_worker > 0:
         command.extend(["--max-tasks-per-worker", str(args.max_tasks_per_worker)])
@@ -534,9 +598,14 @@ def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, sp
     if variant.template_registration != "off":
         env["FFAC_TEMPLATE_REGISTRATION"] = variant.template_registration
         env["FFAC_TEMPLATE_REGISTRATION_MODE"] = variant.template_mode
+        if variant.template_strict:
+            env["FFAC_TEMPLATE_REGISTRATION_STRICT"] = "on"
+        else:
+            env.pop("FFAC_TEMPLATE_REGISTRATION_STRICT", None)
     else:
         env.pop("FFAC_TEMPLATE_REGISTRATION", None)
         env.pop("FFAC_TEMPLATE_REGISTRATION_MODE", None)
+        env.pop("FFAC_TEMPLATE_REGISTRATION_STRICT", None)
     if master:
         env["FFAC_MASTER_LIGHT_CONTEXT"] = "on"
     else:
@@ -629,7 +698,7 @@ def launch(args: argparse.Namespace) -> None:
                 launched.append({"variant": variant.name, "role": "master", "pid": pid, "log": str(master_log)})
         if start_watchdog:
             watchdog_env = _variant_env(os.environ, variant, master=False, spatial_sigma=args.spatial_sigma)
-            watchdog_log = variant_log_dir / "launcher_watchdog_stdout.log"
+            watchdog_log = variant_log_dir / f"launcher_watchdog_{hostname}.log"
             print("# watchdog:")
             pid = _powershell_process(
                 _watchdog_args(args, variant, queue, control, worker_count),
@@ -659,11 +728,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     cmd = sub.add_parser("commands", help="Emit PowerShell master/watchdog commands.")
-    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, screen_step1, holiday4, holiday5, spatial, global, or all.")
+    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all.")
     cmd.add_argument(
         "--run-set",
         default="all",
-        help="production, rollout, screen_step1, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     cmd.add_argument("--repo", default=".")
     cmd.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
@@ -683,6 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--sanity-every", type=int, default=100)
     cmd.add_argument("--spatial-sigma", type=float, default=6.0)
     cmd.add_argument("--max-tasks-per-worker", type=int, default=80)
+    cmd.add_argument("--idle-exit-seconds", type=float, default=120.0)
+    cmd.add_argument("--threads-per-worker", type=int, default=1)
     cmd.add_argument(
         "--resume-existing",
         action="store_true",
@@ -695,11 +766,11 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.set_defaults(func=commands)
 
     launcher = sub.add_parser("launch", help="Start production/hardcase campaign processes in background.")
-    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
+    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, final_geometry, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
     launcher.add_argument(
         "--run-set",
         default="hardcases",
-        help="production, rollout, hardcases, screen_step1, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, hardcases, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     launcher.add_argument(
         "--role",
@@ -730,6 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     launcher.add_argument("--sanity-every", type=int, default=100)
     launcher.add_argument("--spatial-sigma", type=float, default=6.0)
     launcher.add_argument("--max-tasks-per-worker", type=int, default=80)
+    launcher.add_argument("--idle-exit-seconds", type=float, default=120.0)
+    launcher.add_argument("--threads-per-worker", type=int, default=1)
     launcher.add_argument("--resume-existing", action="store_true")
     launcher.add_argument("--exact-logs-dir", action="store_true")
     launcher.add_argument("--use-history", action="store_true")

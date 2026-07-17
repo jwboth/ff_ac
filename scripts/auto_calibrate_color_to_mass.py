@@ -243,7 +243,11 @@ def build_param_space(run, bounds_map, signal_label=None, signal_labels=None,
     return space
 
 
-def sample_params(param_space: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def sample_params(
+    param_space: Sequence[Dict[str, Any]],
+    rng: Optional[random.Random] = None,
+) -> Dict[str, Any]:
+    random_source = rng or random
     samples: Dict[str, Any] = {}
     for _, entries in _value_entries_by_label(param_space).items():
         lower, upper = _monotonic_bounds(entries)
@@ -255,16 +259,18 @@ def sample_params(param_space: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 min_i = lower[i] if prev is None else max(lower[i], prev)
                 max_i = upper[i]
-                val = min_i if max_i <= min_i else (min_i + random.random() * (max_i - min_i))
+                val = min_i if max_i <= min_i else (
+                    min_i + random_source.random() * (max_i - min_i)
+                )
             samples[entry["name"]] = val
             prev = val
     for entry in param_space:
         if entry["name"] in samples:
             continue
         low, high = entry["bounds"]
-        samples[entry["name"]] = (int(round(random.uniform(low, high)))
+        samples[entry["name"]] = (int(round(random_source.uniform(low, high)))
                                   if entry.get("type", "float") == "int"
-                                  else random.uniform(low, high))
+                                  else random_source.uniform(low, high))
     return samples
 
 

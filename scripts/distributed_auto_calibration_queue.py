@@ -26,6 +26,7 @@ import argparse
 import ast
 import copy
 import gc
+import hashlib
 import json
 import math
 import os
@@ -92,6 +93,14 @@ READ_JITTER_MAX_SECONDS = 0.2
 
 def _now() -> float:
     return time.time()
+
+
+def _derived_run_seed(base_seed: Optional[int], run: str) -> Optional[int]:
+    """Create a stable, independent seed while preserving method pairing per run."""
+    if base_seed is None:
+        return None
+    payload = f"{int(base_seed)}:{run.lower()}".encode("utf-8")
+    return int.from_bytes(hashlib.blake2s(payload, digest_size=4).digest(), "big")
 
 
 def _hostname() -> str:
@@ -836,6 +845,7 @@ def _generate_warmup_params(
     warmup_levels_default: Optional[int],
     warmup_high: Optional[float],
     warmup_mode: str,
+    rng: Optional[random.Random] = None,
 ) -> List[Dict[str, Any]]:
     warmups: List[Dict[str, Any]] = []
 
@@ -1053,7 +1063,7 @@ def _generate_warmup_params(
     seen = set()
     unique: List[Dict[str, Any]] = []
     for _ in range(max(0, warmup_iters)):
-        warmups.append(sample_params(context.param_space))
+        warmups.append(sample_params(context.param_space, rng=rng))
     for wp in warmups:
         key = tuple(sorted(wp.items()))
         if key in seen:
@@ -1670,6 +1680,7 @@ def master_main(args: argparse.Namespace) -> None:
         "warmup_mode": args.warmup_mode,
         "skip_warmup": args.skip_warmup,
         "max_iters": args.max_iters,
+        "optuna_seed": getattr(args, "optuna_seed", None),
         "run_mode": args.run_mode,
         "max_in_flight": args.max_in_flight,
         "max_in_flight_per_run": args.max_in_flight_per_run,
@@ -1688,6 +1699,9 @@ def master_main(args: argparse.Namespace) -> None:
         "titration_recipe": os.environ.get("FFAC_TITRATION_RECIPE", ""),
         "static_light_correction": os.environ.get("FFAC_STATIC_LIGHT_CORRECTION", ""),
         "couple_aq_gas": os.environ.get("FFAC_COUPLE_AQ_GAS", ""),
+        "template_registration": os.environ.get("FFAC_TEMPLATE_REGISTRATION", ""),
+        "template_registration_mode": os.environ.get("FFAC_TEMPLATE_REGISTRATION_MODE", ""),
+        "template_registration_strict": os.environ.get("FFAC_TEMPLATE_REGISTRATION_STRICT", ""),
     }
 
     def _log_master(message: str) -> None:
@@ -1730,6 +1744,7 @@ def master_main(args: argparse.Namespace) -> None:
             return
 
     def _init_run_state(run: str) -> RunState:
+        run_seed = _derived_run_seed(getattr(args, "optuna_seed", None), run)
         ctx = build_context(
             run=run,
             config_dir=Path(args.config_dir),
@@ -1796,8 +1811,21 @@ def master_main(args: argparse.Namespace) -> None:
                 warmup_levels_default=warmup_levels_default,
                 warmup_high=args.warmup_high,
                 warmup_mode=args.warmup_mode,
+                rng=random.Random(run_seed) if run_seed is not None else None,
             )
         distributions = _build_distributions(ctx.param_space)
+        sampler = (
+            optuna.samplers.TPESampler(seed=run_seed)
+            if run_seed is not None
+            else None
+        )
+        if run_seed is not None:
+            _log_master(
+                f"[{run}] paired search seed base={args.optuna_seed} derived={run_seed}"
+            )
+        study_kwargs: Dict[str, Any] = {}
+        if sampler is not None:
+            study_kwargs["sampler"] = sampler
         if getattr(args, "optuna_persist", False):
             storage_dir = Path(args.optuna_storage_dir) if args.optuna_storage_dir else logs_dir
             storage_dir.mkdir(parents=True, exist_ok=True)
@@ -1808,6 +1836,7 @@ def master_main(args: argparse.Namespace) -> None:
                 study_name=f"{run}_optuna",
                 storage=storage_uri,
                 load_if_exists=True,
+                **study_kwargs,
             )
             if args.use_history and history_source is not None:
                 if study.trials:
@@ -1818,7 +1847,7 @@ def master_main(args: argparse.Namespace) -> None:
                     for trial in _load_history_trials(history_source, distributions):
                         study.add_trial(trial)
         else:
-            study = optuna.create_study(direction="minimize")
+            study = optuna.create_study(direction="minimize", **study_kwargs)
             if args.use_history and history_source is not None:
                 for trial in _load_history_trials(history_source, distributions):
                     study.add_trial(trial)
@@ -3354,6 +3383,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     master.add_argument("--bounds-file", default=None)
     master.add_argument("--max-iters", type=int, default=40)
+    master.add_argument(
+        "--optuna-seed",
+        type=int,
+        default=None,
+        help="Optional paired seed for random warmups and the Optuna TPE sampler.",
+    )
     master.add_argument("--warmup-iters", type=int, default=100)
     master.add_argument("--warmup-levels", default=None)
     master.add_argument(
