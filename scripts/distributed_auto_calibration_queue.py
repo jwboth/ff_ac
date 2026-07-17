@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -83,6 +83,7 @@ except Exception:  # pragma: no cover
 
 
 QUEUE_SUBDIRS = ["pending", "in_progress", "results", "done", "failed", "heartbeats", "worker_logs"]
+MASTER_COMPLETE_FILENAME = "master_complete.json"
 PENDING_PICK_WINDOW = 32
 MAX_CLAIM_ATTEMPTS = 5
 CLAIM_JITTER_MAX_SECONDS = 0.5
@@ -124,6 +125,57 @@ def _ensure_queue_dirs(queue: Path) -> Dict[str, Path]:
         path.mkdir(parents=True, exist_ok=True)
         dirs[name] = path
     return dirs
+
+
+def _master_complete_path(queue: Path) -> Path:
+    return Path(queue) / MASTER_COMPLETE_FILENAME
+
+
+def _queue_is_complete(queue: Path) -> bool:
+    return _safe_exists(_master_complete_path(queue))
+
+
+def _clear_master_complete(queue: Path) -> None:
+    marker = _master_complete_path(queue)
+    if _safe_exists(marker) and not _safe_unlink(marker, attempts=10, delay=0.1):
+        raise RuntimeError(f"Unable to remove stale completion marker: {marker}")
+
+
+def _mark_master_complete(queue: Path, runs: Sequence[str]) -> bool:
+    Path(queue).mkdir(parents=True, exist_ok=True)
+    now = _now()
+    completed_at_utc = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    payload = {
+        "status": "complete",
+        "completed_at": now,
+        "completed_at_utc": completed_at_utc,
+        "master_hostname": _hostname(),
+        "master_pid": os.getpid(),
+        "runs": list(runs),
+    }
+    return _safe_write_json(
+        _master_complete_path(queue),
+        payload,
+        attempts=10,
+        delay=0.1,
+    )
+
+
+def _worker_context_is_idle(
+    context_cache: Mapping[Any, Any],
+    last_task_finished_at: Optional[float],
+    idle_exit_seconds: float,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    if not context_cache or last_task_finished_at is None or idle_exit_seconds <= 0:
+        return False
+    current = _now() if now is None else float(now)
+    return current - float(last_task_finished_at) >= float(idle_exit_seconds)
 
 
 def _clear_queue(queue: Path) -> None:
@@ -1543,6 +1595,7 @@ def _write_master_commands(logs_dir: Path, queue: Path, args) -> None:
 
 def master_main(args: argparse.Namespace) -> None:
     queue = Path(args.queue)
+    _clear_master_complete(queue)
     if not getattr(args, "no_clear_queue", False):
         _clear_queue(queue)   # clear leftover/orphan tasks on startup BY DEFAULT
     dirs = _ensure_queue_dirs(queue)
@@ -1638,7 +1691,7 @@ def master_main(args: argparse.Namespace) -> None:
     }
 
     def _log_master(message: str) -> None:
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}Z] {message}"
         print(line, flush=True)
         try:
@@ -2344,8 +2397,18 @@ def master_main(args: argparse.Namespace) -> None:
                         idx = runs.index(run)
                         active_run = runs[idx + 1] if idx + 1 < len(runs) else None
 
-        if len(run_states) == len(runs) and all(s.phase == "done" for s in run_states.values()):
-            break
+        all_runs_done = len(run_states) == len(runs) and all(
+            state.phase == "done" for state in run_states.values()
+        )
+        if all_runs_done and not in_flight:
+            if _mark_master_complete(queue, runs):
+                _log_master(
+                    f"master complete runs={len(runs)}; completion marker written to "
+                    f"{_master_complete_path(queue)}"
+                )
+                _log_master_mem(force=True)
+                break
+            _log_master("completion marker write failed; retrying")
         time.sleep(poll)
 
 
@@ -2488,7 +2551,12 @@ def worker_loop(args: argparse.Namespace) -> None:
     worker_state = _read_worker_state(log_dir, worker_id)
     last_run = worker_state.get("last_run") if worker_state else None
     max_tasks_per_worker = max(0, int(getattr(args, "max_tasks_per_worker", 0) or 0))
+    idle_exit_seconds = max(
+        0.0,
+        float(getattr(args, "idle_exit_seconds", 0.0) or 0.0),
+    )
     tasks_done = 0
+    last_task_finished_at: Optional[float] = None
 
     heartbeat_dir = dirs["heartbeats"]
     heartbeat_path = heartbeat_dir / f"{worker_id}.json"
@@ -2596,6 +2664,21 @@ def worker_loop(args: argparse.Namespace) -> None:
         return count
 
     while True:
+        if _queue_is_complete(queue):
+            _shutdown_worker("master-complete")
+            return
+        if _worker_context_is_idle(
+            context_cache,
+            last_task_finished_at,
+            idle_exit_seconds,
+        ):
+            print(
+                f"[{worker_id}] loaded context idle for {idle_exit_seconds:.0f}s; "
+                "exiting to release memory"
+            )
+            _write_worker_state(log_dir, worker_id, {"last_run": None})
+            _shutdown_worker("idle-context-timeout")
+            return
         limit = _read_worker_limit(args.control_dir, worker_hostname)
         if limit is not None and worker_index is not None and worker_index >= limit:
             print(f"[{worker_id}] limit={limit} -> exiting")
@@ -2912,6 +2995,7 @@ def worker_loop(args: argparse.Namespace) -> None:
                 current_task["task_id"] = None
                 current_task["run"] = None
                 current_task["started_at"] = None
+            last_task_finished_at = _now()
             if sanity_lock_acquired:
                 _release_sanity_lock(args.control_dir, worker_hostname, worker_id)
         if max_tasks_per_worker > 0 and task_completed:
@@ -2965,7 +3049,7 @@ def watchdog_main(args: argparse.Namespace) -> None:
     slots: Dict[int, Dict[str, Any]] = {}
 
     def _log_event(message: str) -> None:
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}Z] {message}"
         print(line, flush=True)
         try:
@@ -2993,7 +3077,58 @@ def watchdog_main(args: argparse.Namespace) -> None:
             return workers, limit
         return max(0, int(limit)), limit
 
+    def _stop_all_workers(reason: str) -> None:
+        alive_processes = [
+            slot["proc"] for slot in slots.values() if slot["proc"].is_alive()
+        ]
+        for proc in alive_processes:
+            try:
+                proc.join(timeout=2.0)
+            except Exception:
+                pass
+        for proc in alive_processes:
+            if not proc.is_alive():
+                continue
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        for proc in alive_processes:
+            try:
+                proc.join(timeout=5.0)
+            except Exception:
+                pass
+            if proc.is_alive():
+                try:
+                    proc.kill()
+                    proc.join(timeout=2.0)
+                except Exception:
+                    pass
+        for slot in slots.values():
+            _safe_unlink(dirs["heartbeats"] / f"{slot['worker_id']}.json")
+        slots.clear()
+        _write_watchdog_state(
+            args.control_dir,
+            hostname,
+            0,
+            0,
+            current_thread_limit,
+            _read_cache_control(args.control_dir, hostname),
+        )
+        _log_event(f"watchdog stopped reason={reason}")
+
     current_desired, current_limit = _desired_workers()
+    if _queue_is_complete(queue):
+        _write_watchdog_state(
+            args.control_dir,
+            hostname,
+            0,
+            0,
+            current_thread_limit,
+            _read_cache_control(args.control_dir, hostname),
+        )
+        _log_event("queue already complete; watchdog exiting without workers")
+        return
     for idx in range(current_desired):
         _ensure_worker(idx)
         if args.stagger_seconds:
@@ -3001,6 +3136,9 @@ def watchdog_main(args: argparse.Namespace) -> None:
     _log_event(f"watchdog started workers={current_desired} limit={current_limit}")
     try:
         while True:
+            if _queue_is_complete(queue):
+                _log_event("master completion marker detected")
+                break
             now = _now()
             desired, new_limit = _desired_workers()
             if desired != current_desired:
@@ -3095,11 +3233,9 @@ def watchdog_main(args: argparse.Namespace) -> None:
                 break
             time.sleep(1.0)
     except KeyboardInterrupt:
-        for slot in slots.values():
-            try:
-                slot["proc"].terminate()
-            except Exception:
-                continue
+        _log_event("watchdog interrupted")
+    finally:
+        _stop_all_workers("master-complete" if _queue_is_complete(queue) else "watchdog-exit")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3388,6 +3524,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restart worker after N tasks (0=disabled).",
     )
     worker.add_argument(
+        "--idle-exit-seconds",
+        type=float,
+        default=300.0,
+        help="Exit a worker that holds a loaded context after this many idle seconds "
+             "so the watchdog can respawn it without retained image memory (0=disabled).",
+    )
+    worker.add_argument(
         "--memmap-cache",
         choices=["off", "images", "arrays", "all"],
         default=None,
@@ -3483,6 +3626,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Restart worker after N tasks (0=disabled).",
+    )
+    watchdog.add_argument(
+        "--idle-exit-seconds",
+        type=float,
+        default=300.0,
+        help="Exit and respawn workers retaining an idle context after this many seconds "
+             "(0=disabled).",
     )
     watchdog.add_argument(
         "--worker-stall-seconds",

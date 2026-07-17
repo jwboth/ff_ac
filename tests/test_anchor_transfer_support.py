@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 
 import numpy as np
@@ -10,8 +11,13 @@ from scripts.auto_calibrate_color_to_mass import (
     _porous_baseline_median,
 )
 from scripts.distributed_auto_calibration_queue import (
+    _clear_master_complete,
     _fixed_params_for_run,
     _load_fixed_params_file,
+    _mark_master_complete,
+    _queue_is_complete,
+    _worker_context_is_idle,
+    watchdog_main,
 )
 
 
@@ -76,3 +82,50 @@ def test_anchor_gain_is_diagonal_and_clipped():
     )
     np.testing.assert_allclose(raw, [3.0, 0.5, 1.0], atol=1e-6)
     np.testing.assert_allclose(gain, [2.0, 0.6, 1.0], atol=1e-6)
+
+
+def test_master_completion_marker_round_trip(tmp_path):
+    assert not _queue_is_complete(tmp_path)
+    assert _mark_master_complete(tmp_path, ["ac20", "ac24"])
+    assert _queue_is_complete(tmp_path)
+
+    payload = json.loads((tmp_path / "master_complete.json").read_text())
+    assert payload["status"] == "complete"
+    assert payload["runs"] == ["ac20", "ac24"]
+
+    _clear_master_complete(tmp_path)
+    assert not _queue_is_complete(tmp_path)
+
+
+def test_loaded_worker_context_expires_only_after_idle_limit():
+    cache = {("ac20",): object()}
+    assert not _worker_context_is_idle(cache, 100.0, 300.0, now=399.9)
+    assert _worker_context_is_idle(cache, 100.0, 300.0, now=400.0)
+    assert not _worker_context_is_idle({}, 100.0, 300.0, now=1000.0)
+    assert not _worker_context_is_idle(cache, None, 300.0, now=1000.0)
+    assert not _worker_context_is_idle(cache, 100.0, 0.0, now=1000.0)
+
+
+def test_watchdog_does_not_spawn_workers_for_completed_queue(tmp_path):
+    queue = tmp_path / "queue"
+    control = tmp_path / "control"
+    assert _mark_master_complete(queue, ["ac20"])
+    args = argparse.Namespace(
+        queue=str(queue),
+        workers=2,
+        worker_id_prefix="test-host",
+        worker_id=None,
+        control_dir=str(control),
+        worker_log_dir=None,
+        thread_limit=1,
+        worker_stall_seconds=600.0,
+    )
+
+    watchdog_main(args)
+
+    assert not list((queue / "heartbeats").glob("*.json"))
+    states = list(control.glob("*.watchdog.json"))
+    assert len(states) == 1
+    state = json.loads(states[0].read_text())
+    assert state["desired_workers"] == 0
+    assert state["workers_running"] == 0

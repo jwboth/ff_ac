@@ -194,6 +194,7 @@ def _watchdog_command(
         str(workers),
         "--worker-stall-seconds 900",
         "--max-tasks-per-worker 12",
+        "--idle-exit-seconds 120",
         "--threads-per-worker 1",
     ]
 
@@ -453,6 +454,7 @@ def status(args: argparse.Namespace) -> None:
         for folder in ("pending", "in_progress", "results", "done", "failed", "heartbeats"):
             path = queue_path / folder
             row[folder] = len(list(path.glob("*"))) if path.exists() else 0
+        row["complete"] = int((queue_path / "master_complete.json").exists())
         row["finals"] = len(list(logs.glob("final_full_scale_ac*.json"))) if logs.exists() else 0
         rows.append(row)
     print(json.dumps(rows, indent=2))
