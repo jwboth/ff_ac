@@ -555,6 +555,153 @@ def _apply_static_light_correction(
     )
 
 
+_ANCHOR_BASELINE_MEDIAN_CACHE: Dict[Tuple[str, Tuple[int, ...], int], np.ndarray] = {}
+
+
+def _porous_baseline_median(
+    rgb: np.ndarray,
+    labels: np.ndarray,
+    active_labels: Sequence[int],
+    *,
+    stride: int = 8,
+) -> np.ndarray:
+    """Robust RGB median in active porous facies, sampled for low memory use."""
+
+    arr = np.asarray(rgb)
+    facies = np.asarray(labels)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"Expected RGB baseline, got shape {arr.shape}")
+    if facies.shape[:2] != arr.shape[:2]:
+        raise ValueError(
+            f"Baseline/facies shape mismatch: {arr.shape[:2]} vs {facies.shape[:2]}"
+        )
+    step = max(1, int(stride))
+    sampled = np.asarray(arr[::step, ::step, :3], dtype=np.float32)
+    sampled_labels = facies[::step, ::step]
+    mask = np.isin(sampled_labels, np.asarray(active_labels, dtype=int))
+    mask &= np.all(np.isfinite(sampled), axis=2)
+    if int(np.count_nonzero(mask)) < 1000:
+        raise ValueError(
+            f"Only {int(np.count_nonzero(mask))} active baseline samples found"
+        )
+    return np.asarray(np.median(sampled[mask], axis=0), dtype=np.float32)
+
+
+def _compute_anchor_photometric_gain(
+    target_median: np.ndarray,
+    anchor_median: np.ndarray,
+    *,
+    gain_low: float = 0.5,
+    gain_high: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    target = np.maximum(np.asarray(target_median, dtype=np.float32), 1e-6)
+    anchor = np.maximum(np.asarray(anchor_median, dtype=np.float32), 1e-6)
+    raw = anchor / target
+    return raw, np.clip(raw, float(gain_low), float(gain_high)).astype(np.float32)
+
+
+def _apply_anchor_photometric_gain(image: Any, gain: np.ndarray) -> None:
+    gain_arr = np.asarray(gain, dtype=np.float32).reshape(1, 1, 3)
+    if np.allclose(gain_arr, 1.0, rtol=0.0, atol=1e-7):
+        return
+    source = np.asarray(image.img)
+    arr = np.asarray(source, dtype=np.float32).copy()
+    arr[..., :3] = np.clip(arr[..., :3] * gain_arr, 0.0, 1.0)
+    image.img = arr.astype(source.dtype, copy=False)
+
+
+def _setup_anchor_photometric_gain(
+    *,
+    run: str,
+    config: Any,
+    fluidflower: Any,
+    active_labels: Sequence[int],
+    master_light_context: bool,
+) -> Optional[np.ndarray]:
+    """Derive one global RGB gain from target and anchor pre-injection baselines."""
+
+    anchor_run = os.environ.get("FFAC_PHOTOMETRIC_ANCHOR_RUN", "").strip().lower()
+    if anchor_run in {"", "0", "false", "no", "none", "off"}:
+        return None
+    if master_light_context:
+        logger.info(
+            "[%s] photometric anchor=%s deferred to workers (light master)",
+            run,
+            anchor_run,
+        )
+        return None
+
+    try:
+        results_dir = Path(getattr(getattr(config, "data", None), "results"))
+        results_root = results_dir.parent
+        target_rig = results_dir / "setup" / "rig"
+        anchor_rig = results_root / anchor_run / "setup" / "rig"
+        target_labels_path = target_rig / "facies.npz"
+        anchor_labels_path = anchor_rig / "facies.npz"
+        anchor_baseline_path = anchor_rig / "shape_corrected_baseline.npz"
+        for required in (target_labels_path, anchor_labels_path, anchor_baseline_path):
+            if not required.exists():
+                raise FileNotFoundError(required)
+
+        stride = max(1, int(os.environ.get("FFAC_PHOTOMETRIC_ANCHOR_STRIDE", "8")))
+        labels_tuple = tuple(sorted(int(label) for label in active_labels))
+        target_labels = np.load(target_labels_path, allow_pickle=True)["array"]
+        target_rgb = np.asarray(
+            getattr(fluidflower, "shape_corrected_baseline").img,
+            dtype=np.float32,
+        )
+        target_median = _porous_baseline_median(
+            target_rgb,
+            target_labels,
+            labels_tuple,
+            stride=stride,
+        )
+
+        cache_key = (str(anchor_baseline_path).lower(), labels_tuple, stride)
+        anchor_median = _ANCHOR_BASELINE_MEDIAN_CACHE.get(cache_key)
+        if anchor_median is None:
+            anchor_rgb = _registration_baseline_array(anchor_baseline_path)
+            anchor_labels = np.load(anchor_labels_path, allow_pickle=True)["array"]
+            anchor_median = _porous_baseline_median(
+                anchor_rgb,
+                anchor_labels,
+                labels_tuple,
+                stride=stride,
+            )
+            _ANCHOR_BASELINE_MEDIAN_CACHE[cache_key] = anchor_median
+
+        gain_low = float(os.environ.get("FFAC_PHOTOMETRIC_ANCHOR_GAIN_MIN", "0.5"))
+        gain_high = float(os.environ.get("FFAC_PHOTOMETRIC_ANCHOR_GAIN_MAX", "2.0"))
+        if not 0.0 < gain_low <= gain_high:
+            raise ValueError(
+                f"Invalid photometric anchor gain limits [{gain_low}, {gain_high}]"
+            )
+        raw_gain, gain = _compute_anchor_photometric_gain(
+            target_median,
+            anchor_median,
+            gain_low=gain_low,
+            gain_high=gain_high,
+        )
+        logger.info(
+            "[%s] photometric anchor ACTIVE target=%s anchor=%s mode=baseline-diagonal "
+            "target_rgb=%s anchor_rgb=%s raw_gain=%s gain=%s",
+            run,
+            run,
+            anchor_run,
+            np.round(target_median, 5).tolist(),
+            np.round(anchor_median, 5).tolist(),
+            np.round(raw_gain, 5).tolist(),
+            np.round(gain, 5).tolist(),
+        )
+        return gain
+    except Exception as exc:  # noqa: BLE001
+        strict = os.environ.get("FFAC_PHOTOMETRIC_ANCHOR_STRICT", "").strip().lower()
+        if strict in {"1", "true", "yes", "on"}:
+            raise
+        logger.warning("[%s] photometric anchor requested but skipped: %s", run, exc)
+        return None
+
+
 def _template_registration_target() -> str:
     value = os.environ.get("FFAC_TEMPLATE_REGISTRATION", "").strip().lower()
     if value in {"", "0", "false", "no", "none", "off"}:
@@ -999,6 +1146,17 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
         "yes",
         "on",
     )
+    anchor_photometric_gain = _setup_anchor_photometric_gain(
+        run=run,
+        config=config,
+        fluidflower=fluidflower,
+        active_labels=signal_labels,
+        master_light_context=light_master,
+    )
+    if anchor_photometric_gain is not None:
+        color_base = getattr(getattr(cta, "color_analysis", None), "base", None)
+        if color_base is not None:
+            _apply_anchor_photometric_gain(color_base, anchor_photometric_gain)
     if light_master:
         template_registration, template_registration_mode = None, "off"
     else:
@@ -1101,6 +1259,9 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             except Exception:
                 t_h = float(len(loaded))
             loaded.append((img, injected, t_h))
+        if anchor_photometric_gain is not None:
+            for image, _injected, _t_h in loaded:
+                _apply_anchor_photometric_gain(image, anchor_photometric_gain)
         _apply_static_light_correction(loaded, mode=static_light_correction, run=run)
         logger.info("[%s] preloaded %d calibration image(s); active labels=%s",
                     run, len(loaded), signal_labels)

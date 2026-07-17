@@ -160,6 +160,68 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_fixed_params_file(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load one shared parameter set or an explicit per-run mapping.
+
+    A normal ``final_full_scale_<run>.json`` can be passed directly; its
+    top-level ``params`` mapping is applied to every requested run. Campaign
+    helpers may instead write ``params_by_run`` when targets need different
+    frozen parameter sets.
+    """
+
+    payload = _load_json(Path(path))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Fixed parameter file must contain a JSON object: {path}")
+
+    shared = payload.get("params")
+    if isinstance(shared, dict):
+        return {"*": dict(shared)}
+
+    per_run = payload.get("params_by_run", payload)
+    if not isinstance(per_run, dict) or not per_run:
+        raise ValueError(
+            f"Fixed parameter file needs 'params' or 'params_by_run': {path}"
+        )
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for run, params in per_run.items():
+        if not isinstance(params, dict):
+            raise ValueError(f"Fixed parameters for {run!r} are not a JSON object")
+        parsed[str(run).lower()] = dict(params)
+    return parsed
+
+
+def _fixed_params_for_run(
+    fixed_params: Optional[Mapping[str, Mapping[str, Any]]],
+    run: str,
+    param_space: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if fixed_params is None:
+        return None
+    source = fixed_params.get(run.lower()) or fixed_params.get("*")
+    if source is None:
+        raise KeyError(f"No fixed parameter set found for run {run!r}")
+
+    expected = [str(entry["name"]) for entry in param_space]
+    missing = [name for name in expected if name not in source]
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise ValueError(f"Fixed parameters for {run} miss {len(missing)} key(s): {preview}{suffix}")
+
+    result: Dict[str, Any] = {}
+    entries = {str(entry["name"]): entry for entry in param_space}
+    for name in expected:
+        entry = entries[name]
+        value = int(source[name]) if entry.get("type") == "int" else float(source[name])
+        low, high = entry["bounds"]
+        if value < float(low) - 1e-9 or value > float(high) + 1e-9:
+            raise ValueError(
+                f"Fixed parameter {name}={value} for {run} is outside [{low}, {high}]"
+            )
+        result[name] = value
+    return result
+
+
 def _safe_write_json(
     path: Path, payload: dict, attempts: int = 3, delay: float = 0.05
 ) -> bool:
@@ -1508,6 +1570,17 @@ def master_main(args: argparse.Namespace) -> None:
     orphan_dir.mkdir(parents=True, exist_ok=True)
 
     bounds_map = load_bounds_map(Path(args.bounds_file)) if args.bounds_file else {}
+    fixed_params_file = getattr(args, "fixed_params_file", None)
+    fixed_params_map = (
+        _load_fixed_params_file(Path(fixed_params_file)) if fixed_params_file else None
+    )
+    if fixed_params_map is not None:
+        if int(args.max_iters) != 0:
+            raise ValueError("--fixed-params-file requires --max-iters 0")
+        if args.use_last_best or args.use_history:
+            raise ValueError(
+                "--fixed-params-file cannot be combined with --use-last-best or --use-history"
+            )
 
     from darsia.presets.workflows.rig import Rig
 
@@ -1534,6 +1607,7 @@ def master_main(args: argparse.Namespace) -> None:
         "no_save_calibration": args.no_save_calibration,
         "use_last_best": args.use_last_best,
         "use_history": args.use_history,
+        "fixed_params_file": fixed_params_file,
         "bounds_file": args.bounds_file,
         "param_ranges": args.param_ranges,
         "param_levels": args.param_levels,
@@ -1640,6 +1714,12 @@ def master_main(args: argparse.Namespace) -> None:
             history_path if history_path.exists() else (tmp_history_path if tmp_history_path.exists() else None)
         )
 
+        fixed_params = _fixed_params_for_run(
+            fixed_params_map,
+            run,
+            ctx.param_space,
+        )
+
         init_params = None
         if args.use_last_best and load_best_params_from_csv is not None and history_source is not None:
             try:
@@ -1647,7 +1727,12 @@ def master_main(args: argparse.Namespace) -> None:
             except Exception:
                 init_params = None
 
-        if args.skip_warmup or ((args.use_last_best or args.use_history) and history_source is not None):
+        if fixed_params is not None:
+            warmups = [fixed_params]
+            _log_master(
+                f"[{run}] fixed evaluation ACTIVE source={fixed_params_file} params={len(fixed_params)}"
+            )
+        elif args.skip_warmup or ((args.use_last_best or args.use_history) and history_source is not None):
             warmups = []
         else:
             warmups = _generate_warmup_params(
@@ -3123,6 +3208,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         type=_parse_bool,
         help="Seed Optuna with all valid trials from history CSV (true/false).",
+    )
+    master.add_argument(
+        "--fixed-params-file",
+        default=None,
+        help="Evaluate one frozen parameter set per run and skip Optuna. Accepts a "
+             "final_full_scale JSON with top-level 'params', or JSON containing "
+             "'params_by_run'. Requires --max-iters 0.",
     )
     master.add_argument("--bounds-file", default=None)
     master.add_argument("--max-iters", type=int, default=40)
