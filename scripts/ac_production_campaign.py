@@ -122,6 +122,7 @@ class Variant:
     template_mode: str = "partial_affine"
     template_strict: bool = False
     static_reference: str = "median"
+    signal_parameterization: str = "per-label"
     optuna_seed: int | None = None
     note: str = ""
 
@@ -267,6 +268,28 @@ VARIANTS = [
         note="full-budget AC14 template registration, paired Optuna seed 73",
     ),
     Variant(
+        "reduced_template_ac14_seed17",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_reduced_shared_shape.json",
+        template_registration="ac14_template",
+        template_strict=True,
+        signal_parameterization="shared-shape",
+        optuna_seed=17,
+        note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 17",
+    ),
+    Variant(
+        "reduced_template_ac14_seed73",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_reduced_shared_shape.json",
+        template_registration="ac14_template",
+        template_strict=True,
+        signal_parameterization="shared-shape",
+        optuna_seed=73,
+        note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 73",
+    ),
+    Variant(
         "titration_static_spatial_drift025",
         "drift:0.25",
         "blue-spatial",
@@ -346,6 +369,10 @@ VARIANT_SETS = {
         "final_baseline_seed73",
         "final_template_ac14_seed73",
     ],
+    "reduced_model": [
+        "reduced_template_ac14_seed17",
+        "reduced_template_ac14_seed73",
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -392,6 +419,8 @@ def _select_runs(run_set: str) -> list[str]:
         return SCREEN_STEP1_RUNS
     if run_set == "final_geometry":
         return FINAL_GEOMETRY_RUNS
+    if run_set == "reduced_model":
+        return FINAL_GEOMETRY_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
@@ -429,6 +458,12 @@ def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION -ErrorAction SilentlyContinue")
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_MODE -ErrorAction SilentlyContinue")
         lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_STRICT -ErrorAction SilentlyContinue")
+    if variant.signal_parameterization != "per-label":
+        lines.append(
+            f"$env:FFAC_SIGNAL_PARAMETERIZATION = '{variant.signal_parameterization}'"
+        )
+    else:
+        lines.append("Remove-Item Env:\\FFAC_SIGNAL_PARAMETERIZATION -ErrorAction SilentlyContinue")
     return lines
 
 
@@ -606,6 +641,10 @@ def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, sp
         env.pop("FFAC_TEMPLATE_REGISTRATION", None)
         env.pop("FFAC_TEMPLATE_REGISTRATION_MODE", None)
         env.pop("FFAC_TEMPLATE_REGISTRATION_STRICT", None)
+    if variant.signal_parameterization != "per-label":
+        env["FFAC_SIGNAL_PARAMETERIZATION"] = variant.signal_parameterization
+    else:
+        env.pop("FFAC_SIGNAL_PARAMETERIZATION", None)
     if master:
         env["FFAC_MASTER_LIGHT_CONTEXT"] = "on"
     else:
@@ -728,11 +767,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     cmd = sub.add_parser("commands", help="Emit PowerShell master/watchdog commands.")
-    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all.")
+    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, reduced_model, final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all.")
     cmd.add_argument(
         "--run-set",
         default="all",
-        help="production, rollout, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, reduced_model, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     cmd.add_argument("--repo", default=".")
     cmd.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
@@ -766,11 +805,11 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.set_defaults(func=commands)
 
     launcher = sub.add_parser("launch", help="Start production/hardcase campaign processes in background.")
-    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, final_geometry, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
+    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, reduced_model, final_geometry, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
     launcher.add_argument(
         "--run-set",
         default="hardcases",
-        help="production, rollout, hardcases, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
+        help="production, rollout, hardcases, reduced_model, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
     )
     launcher.add_argument(
         "--role",

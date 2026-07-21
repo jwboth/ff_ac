@@ -74,6 +74,7 @@ from auto_calibrate_color_to_mass import (  # noqa: E402
     save_best_calibration,
     suggest_params_trial,
     write_history_csv,
+    _normalise_signal_parameterization,  # type: ignore
     _parse_signal_name,  # type: ignore
     _value_entries_by_label,  # type: ignore
 )
@@ -1182,6 +1183,7 @@ def _task_payload(
     enforce_lower: bool,
     objective_integral: str,
     bounds_file: Optional[Path],
+    signal_parameterization: Optional[str] = None,
     trial_number: Optional[int] = None,
     attempt: int = 0,
     quality: Optional[Dict[str, Any]] = None,
@@ -1205,6 +1207,8 @@ def _task_payload(
         "attempt": attempt,
         "created_at": _now(),
     }
+    if signal_parameterization:
+        payload["signal_parameterization"] = signal_parameterization
     if quality:
         payload["quality"] = quality
     if sanity:
@@ -1508,6 +1512,9 @@ def requeue_failed_main(args: argparse.Namespace) -> None:
     quality_spec = _build_quality_spec(args.quality_scale, args.quality_dtype)
     sanity_scale = args.sanity_scale if args.sanity_scale is not None else args.quality_scale
     sanity_dtype = args.sanity_dtype if args.sanity_dtype is not None else args.quality_dtype
+    signal_parameterization = _normalise_signal_parameterization(
+        os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
+    )
     moved_dir = dirs["failed"] / "requeued"
     if not args.keep_failed:
         moved_dir.mkdir(parents=True, exist_ok=True)
@@ -1546,6 +1553,7 @@ def requeue_failed_main(args: argparse.Namespace) -> None:
             args.enforce_lower,
             args.objective_integral,
             Path(args.bounds_file) if args.bounds_file else None,
+            signal_parameterization=signal_parameterization,
             attempt=0,
             quality=quality_spec,
         )
@@ -1655,6 +1663,9 @@ def master_main(args: argparse.Namespace) -> None:
     quality_spec = _build_quality_spec(args.quality_scale, args.quality_dtype)
     sanity_scale = args.sanity_scale if args.sanity_scale is not None else args.quality_scale
     sanity_dtype = args.sanity_dtype if args.sanity_dtype is not None else args.quality_dtype
+    signal_parameterization = _normalise_signal_parameterization(
+        os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
+    )
     run_states: Dict[str, RunState] = {}
     in_flight: Dict[str, TaskInfo] = {}
     stale_counts: Dict[str, int] = {}
@@ -1702,6 +1713,7 @@ def master_main(args: argparse.Namespace) -> None:
         "template_registration": os.environ.get("FFAC_TEMPLATE_REGISTRATION", ""),
         "template_registration_mode": os.environ.get("FFAC_TEMPLATE_REGISTRATION_MODE", ""),
         "template_registration_strict": os.environ.get("FFAC_TEMPLATE_REGISTRATION_STRICT", ""),
+        "signal_parameterization": signal_parameterization,
     }
 
     def _log_master(message: str) -> None:
@@ -1757,6 +1769,7 @@ def master_main(args: argparse.Namespace) -> None:
             use_label_weights=args.use_label_weights,
             label_weights=label_weights,
             static_light_correction=os.environ.get("FFAC_STATIC_LIGHT_CORRECTION", "off"),
+            signal_parameterization=signal_parameterization,
         )
         run_label_weights = label_weights
         if args.use_label_weights and args.auto_label_weights and not label_weights:
@@ -2038,6 +2051,7 @@ def master_main(args: argparse.Namespace) -> None:
                     args.enforce_lower,
                     args.objective_integral,
                     Path(args.bounds_file) if args.bounds_file else None,
+                    signal_parameterization=signal_parameterization,
                     trial_number=None,
                     attempt=0,
                     quality=None,
@@ -2104,6 +2118,7 @@ def master_main(args: argparse.Namespace) -> None:
             args.enforce_lower,
             args.objective_integral,
             Path(args.bounds_file) if args.bounds_file else None,
+            signal_parameterization=signal_parameterization,
             trial_number=info.trial.number if info.trial is not None else None,
             attempt=attempt,
             quality=quality_spec,
@@ -2342,6 +2357,7 @@ def master_main(args: argparse.Namespace) -> None:
                             args.enforce_lower,
                             args.objective_integral,
                             Path(args.bounds_file) if args.bounds_file else None,
+                            signal_parameterization=signal_parameterization,
                             quality=quality_spec,
                         )
                         _atomic_write_json(dirs["pending"] / f"{task_id}.json", payload)
@@ -2375,6 +2391,7 @@ def master_main(args: argparse.Namespace) -> None:
                         args.enforce_lower,
                         args.objective_integral,
                         Path(args.bounds_file) if args.bounds_file else None,
+                        signal_parameterization=signal_parameterization,
                         quality=quality_spec,
                     )
                     _atomic_write_json(dirs["pending"] / f"{task_id}.json", payload)
@@ -2403,6 +2420,7 @@ def master_main(args: argparse.Namespace) -> None:
                         args.enforce_lower,
                         args.objective_integral,
                         Path(args.bounds_file) if args.bounds_file else None,
+                        signal_parameterization=signal_parameterization,
                         trial_number=trial.number,
                         quality=quality_spec,
                     )
@@ -2507,6 +2525,10 @@ def worker_loop(args: argparse.Namespace) -> None:
             or os.environ.get("FFAC_STATIC_LIGHT_CORRECTION", "")
             or "off"
         )
+        signal_parameterization = _normalise_signal_parameterization(
+            payload.get("signal_parameterization")
+            or os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
+        )
         quality = quality_override or payload.get("quality")
         scale = 1.0
         dtype = None
@@ -2530,6 +2552,7 @@ def worker_loop(args: argparse.Namespace) -> None:
             dtype,
             objective_integral,
             static_light_correction,
+            signal_parameterization,
         )
         if cache_key in context_cache:
             return context_cache[cache_key]
@@ -2548,6 +2571,7 @@ def worker_loop(args: argparse.Namespace) -> None:
             quality_dtype=dtype,
             objective_integral=objective_integral,
             static_light_correction=static_light_correction,
+            signal_parameterization=signal_parameterization,
         )
         context_cache[cache_key] = ctx
         return ctx

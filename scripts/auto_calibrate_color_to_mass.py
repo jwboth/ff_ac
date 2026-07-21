@@ -57,8 +57,10 @@ PARAM_SPACE_TEMPLATE: List[Dict[str, Any]] = [
 ]
 
 _SIGNAL_PARAM_RE = re.compile(r"^signal\.label(?P<label>-?\d+)\.value(?P<idx>\d+)$")
-_LABEL_VALUE_RE = re.compile(r"(?:signal\.)?label(\d+)\.value(\d+)$", re.IGNORECASE)
+_SHARED_SIGNAL_PARAM_RE = re.compile(r"^signal\.shared\.value(?P<idx>\d+)$")
+_SIGNAL_GAIN_RE = re.compile(r"^signal\.label(?P<label>-?\d+)\.gain$")
 _VALUE_RE = re.compile(r"(?:.*\.)?value(\d+)$", re.IGNORECASE)
+_SHARED_SIGNAL_LABEL = -1
 
 
 # =========================================================================
@@ -94,6 +96,7 @@ class CalibrationContext:
     param_space: List[Dict[str, Any]] = field(default_factory=list)
     enforce_lower: bool = False
     per_label_params: bool = True
+    signal_parameterization: str = "per-label"
     objective_integral: str = "off"
     label_weights: Optional[Dict[int, float]] = None
     calibration_folder: Optional[Path] = None
@@ -106,9 +109,34 @@ class CalibrationContext:
 # =========================================================================
 def _parse_signal_name(name: str) -> Optional[Tuple[int, int]]:
     m = _SIGNAL_PARAM_RE.match(name)
-    if not m:
-        return None
-    return int(m.group("label")), int(m.group("idx"))
+    if m:
+        return int(m.group("label")), int(m.group("idx"))
+    shared = _SHARED_SIGNAL_PARAM_RE.match(name)
+    if shared:
+        return _SHARED_SIGNAL_LABEL, int(shared.group("idx"))
+    return None
+
+
+def _normalise_signal_parameterization(mode: str | None) -> str:
+    value = (
+        mode
+        or os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
+        or "per-label"
+    ).strip().lower().replace("_", "-")
+    aliases = {
+        "default": "per-label",
+        "perlabel": "per-label",
+        "shared": "shared-shape",
+        "reduced": "shared-shape",
+        "shared-gain": "shared-shape",
+        "shared-shape-gain": "shared-shape",
+    }
+    value = aliases.get(value, value)
+    if value not in {"per-label", "shared-shape"}:
+        raise ValueError(
+            f"Unknown signal parameterization {mode!r}; expected per-label or shared-shape."
+        )
+    return value
 
 
 def _value_entries_by_label(param_space: Sequence[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
@@ -211,17 +239,70 @@ def _rebuild_template_signal(template, n_free_values):
     return new_sig + other
 
 
+def _rebuild_shared_shape_signal(
+    template: Sequence[Dict[str, Any]],
+    n_free_values: int,
+    signal_labels: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Build an identifiable shared curve shape with one amplitude per facies.
+
+    The shared shape starts at zero and ends at one. Intermediate values are
+    monotone fractions in [0, 1]. Multiplying by each facies amplitude therefore
+    keeps every effective signal value in the established [0, 2] range without
+    a free shape/amplitude scale degeneracy.
+    """
+
+    other = [e for e in template if not _parse_signal_name(e["name"])]
+    count = max(1, int(n_free_values))
+    shared: List[Dict[str, Any]] = []
+    for idx in range(count + 1):
+        if idx == 0:
+            bounds = (0.0, 0.0)
+        elif idx == count:
+            bounds = (1.0, 1.0)
+        else:
+            bounds = (0.0, 1.0)
+        shared.append(
+            {
+                "name": f"signal.shared.value{idx}",
+                "attr_path": ["signal_model", "shared_shape", "values", idx],
+                "bounds": bounds,
+                "type": "float",
+            }
+        )
+
+    gains = [
+        {
+            "name": f"signal.label{int(label)}.gain",
+            "attr_path": ["signal_model", "model", 1, int(label), "gain"],
+            "bounds": (0.0, 2.0),
+            "type": "float",
+        }
+        for label in sorted({int(label) for label in signal_labels})
+    ]
+    return [*shared, *gains, *copy.deepcopy(other)]
+
+
 def build_param_space(run, bounds_map, signal_label=None, signal_labels=None,
-                      per_label_params=False, use_facies=True, n_free_values=None):
+                      per_label_params=False, use_facies=True, n_free_values=None,
+                      signal_parameterization="per-label"):
+    parameterization = _normalise_signal_parameterization(signal_parameterization)
     base = copy.deepcopy(PARAM_SPACE_TEMPLATE)
     if n_free_values is not None:
         base = _rebuild_template_signal(base, int(n_free_values))
     override = (bounds_map or {}).get(run, {})
     default_override = (bounds_map or {}).get("default", {})
-    sig = [e for e in base if _parse_signal_name(e["name"])]
-    other = [e for e in base if not _parse_signal_name(e["name"])]
     space: List[Dict[str, Any]] = []
-    if per_label_params:
+    if parameterization == "shared-shape":
+        labels = list(signal_labels or ([signal_label] if signal_label is not None else []))
+        free_values = int(n_free_values) if n_free_values is not None else max(
+            (_parse_signal_name(e["name"])[1] for e in base if _parse_signal_name(e["name"])),
+            default=1,
+        )
+        space = _rebuild_shared_shape_signal(base, free_values, labels)
+    elif per_label_params:
+        sig = [e for e in base if _parse_signal_name(e["name"])]
+        other = [e for e in base if not _parse_signal_name(e["name"])]
         labels = list(signal_labels or ([signal_label] if signal_label is not None else []))
         for label in labels:
             for e in sig:
@@ -973,20 +1054,33 @@ def _apply_to_func(func, idx_vals, np_module) -> None:
 def apply_params(calibration, params, labels=None, np_module=None) -> int:
     hetero = calibration.signal_model.model[1]
     per_label: Dict[int, Dict[int, float]] = {}
+    gains: Dict[int, float] = {}
     global_idx: Dict[int, float] = {}
     for k, v in params.items():
-        m = _LABEL_VALUE_RE.match(k)
-        if m:
-            per_label.setdefault(int(m.group(1)), {})[int(m.group(2))] = float(v)
+        parsed = _parse_signal_name(k)
+        if parsed:
+            label, idx = parsed
+            per_label.setdefault(label, {})[idx] = float(v)
+            continue
+        gain = _SIGNAL_GAIN_RE.match(k)
+        if gain:
+            gains[int(gain.group("label"))] = float(v)
             continue
         mv = _VALUE_RE.match(k)
         if mv and not k.lower().startswith("flash"):
             global_idx[int(mv.group(1))] = float(v)
     if labels is None:
         labels = list(hetero.keys()) if hasattr(hetero, "keys") else []
+    shared_shape = per_label.get(_SHARED_SIGNAL_LABEL, {})
     updated = 0
     for lbl in labels:
-        idx_vals = dict(global_idx); idx_vals.update(per_label.get(lbl, {}))
+        idx_vals = dict(global_idx)
+        if shared_shape:
+            amplitude = gains.get(int(lbl), 1.0)
+            idx_vals.update(
+                {idx: float(fraction) * amplitude for idx, fraction in shared_shape.items()}
+            )
+        idx_vals.update(per_label.get(int(lbl), {}))
         if not idx_vals:
             continue
         try:
@@ -1027,8 +1121,9 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                   bounds_map=None, enforce_lower=False, per_label_params=True,
                   use_label_weights=False, label_weights=None, quality_scale=1.0,
                   quality_dtype=None, objective_integral="off",
-                  static_light_correction=None) -> CalibrationContext:
+                  static_light_correction=None, signal_parameterization=None) -> CalibrationContext:
     import numpy as np
+    signal_parameterization = _normalise_signal_parameterization(signal_parameterization)
     from darsia.presets.workflows.analysis.analysis_context import prepare_analysis_context
 
     config_dir = Path(config_dir)
@@ -1452,14 +1547,17 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
         n_free_values = None
     param_space = build_param_space(run, bounds_map, signal_labels=signal_labels,
                                     per_label_params=per_label_params, use_facies=use_facies,
-                                    n_free_values=n_free_values)
+                                    n_free_values=n_free_values,
+                                    signal_parameterization=signal_parameterization)
 
     return CalibrationContext(
         run=run, config=config, experiment=experiment, fluidflower=fluidflower,
         geometry=geometry, calibration=cta, calibration_images=list(ctx_raw.image_paths),
         reference_label=reference_label, signal_label=None, signal_labels=signal_labels,
         param_space=param_space, enforce_lower=enforce_lower,
-        per_label_params=per_label_params, objective_integral=objective_integral,
+        per_label_params=per_label_params,
+        signal_parameterization=signal_parameterization,
+        objective_integral=objective_integral,
         label_weights=label_weights, calibration_folder=calibration_folder, _loaded=loaded,
     )
 
