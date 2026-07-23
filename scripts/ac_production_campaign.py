@@ -110,6 +110,21 @@ FINAL_GEOMETRY_RUNS = [
     "ac60",
 ]
 
+FINAL_EXCLUDED_RUNS = {
+    "ac29": "physical/chemical outlier with low-pH yellow initial state",
+    "ac51": "physical/chemical outlier with low-pH yellow initial state",
+}
+
+FINAL_PRODUCTION_RUNS = [
+    # Put the six fully screened runs first so the first completed batch is informative.
+    *FINAL_GEOMETRY_RUNS,
+    *[
+        run
+        for run in [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
+        if run not in FINAL_GEOMETRY_RUNS and run not in FINAL_EXCLUDED_RUNS
+    ],
+]
+
 
 @dataclass(frozen=True)
 class Variant:
@@ -124,6 +139,7 @@ class Variant:
     static_reference: str = "median"
     signal_parameterization: str = "per-label"
     optuna_seed: int | None = None
+    save_calibration: bool = False
     note: str = ""
 
 
@@ -290,6 +306,19 @@ VARIANTS = [
         note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 73",
     ),
     Variant(
+        "final_production_titration_ac14_seed17",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        save_calibration=True,
+        note=(
+            "final full per-label TitrationFlash model, strict AC14 partial-affine "
+            "registration, point-wise L1, and persistent calibration output"
+        ),
+    ),
+    Variant(
         "titration_static_spatial_drift025",
         "drift:0.25",
         "blue-spatial",
@@ -373,6 +402,9 @@ VARIANT_SETS = {
         "reduced_template_ac14_seed17",
         "reduced_template_ac14_seed73",
     ],
+    "final_production": [
+        "final_production_titration_ac14_seed17",
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -421,12 +453,42 @@ def _select_runs(run_set: str) -> list[str]:
         return FINAL_GEOMETRY_RUNS
     if run_set == "reduced_model":
         return FINAL_GEOMETRY_RUNS
+    if run_set == "final_production":
+        return FINAL_PRODUCTION_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
     if not runs:
         raise SystemExit("No runs selected.")
     return runs
+
+
+def _validate_final_campaign(
+    args: argparse.Namespace,
+    selected: list[Variant],
+    runs: list[str],
+) -> None:
+    if not any(variant.save_calibration for variant in selected):
+        return
+    if len(selected) != 1 or selected[0].name != "final_production_titration_ac14_seed17":
+        raise SystemExit("The persistent final variant must run by itself.")
+    if runs != FINAL_PRODUCTION_RUNS:
+        raise SystemExit(
+            "The persistent final variant requires --run-set final_production "
+            "(40 runs; AC29 and AC51 excluded)."
+        )
+    if int(args.max_iters) != 1600 or int(args.warmup_iters) != 150:
+        raise SystemExit(
+            "The persistent final variant requires --max-iters 1600 "
+            "--warmup-iters 150."
+        )
+    if not args.seed_params_file:
+        raise SystemExit(
+            "The persistent final variant requires --seed-params-file from "
+            "scripts/ac_final_calibration_prepare.py."
+        )
+    if not Path(args.seed_params_file).exists():
+        raise SystemExit(f"Seed parameter file not found: {args.seed_params_file}")
 
 
 def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
@@ -486,8 +548,10 @@ def _common_master_args(args: argparse.Namespace, variant: Variant, queue: str, 
         "--bounds-file",
         _ps_quote(variant.bounds_file),
     ]
-    if not args.save_calibration:
+    if not (args.save_calibration or variant.save_calibration):
         command.append("--no-save-calibration")
+    if args.seed_params_file:
+        command.extend(["--seed-params-file", _ps_quote(args.seed_params_file)])
     if variant.optuna_seed is not None:
         command.extend(["--optuna-seed", str(variant.optuna_seed)])
     command.extend(
@@ -565,8 +629,10 @@ def _worker_counts(args: argparse.Namespace, selected: list[Variant]) -> list[in
 def commands(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
     selected = _select_variants(args.variant)
+    runs = _select_runs(args.run_set)
+    _validate_final_campaign(args, selected, runs)
     worker_counts = _worker_counts(args, selected)
-    run_count = len(_select_runs(args.run_set))
+    run_count = len(runs)
     queue_root = args.queue_root.rstrip("\\/")
     logs_root = args.logs_root.rstrip("\\/")
     control_root = args.control_root.rstrip("\\/") if args.control_root else queue_root
@@ -576,6 +642,8 @@ def commands(args: argparse.Namespace) -> None:
 
     print("# AC production calibration campaign.")
     print(f"# Run set: {args.run_set} ({run_count} runs).")
+    if args.run_set == "final_production":
+        print("# Excluded: ac29, ac51 (documented physical/chemical outliers).")
     print(f"# Variants: {', '.join(variant.name for variant in selected)}")
     print("# Start one master per variant, then one watchdog per active machine for the same variant.")
     print("# --workers is per watchdog. With holiday4, the default 3 gives 12 workers per machine.")
@@ -683,8 +751,10 @@ def _powershell_process(command: list[str], repo: Path, env: dict[str, str], log
 def launch(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
     selected = _select_variants(args.variant)
+    runs = _select_runs(args.run_set)
+    _validate_final_campaign(args, selected, runs)
     worker_counts = _worker_counts(args, selected)
-    run_count = len(_select_runs(args.run_set))
+    run_count = len(runs)
     queue_root = args.queue_root.rstrip("\\/")
     logs_root = args.logs_root.rstrip("\\/")
     control_root = args.control_root.rstrip("\\/") if args.control_root else queue_root
@@ -767,11 +837,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     cmd = sub.add_parser("commands", help="Emit PowerShell master/watchdog commands.")
-    cmd.add_argument("--variant", default="holiday4", help="Variant name, comma-list, reduced_model, final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all.")
+    cmd.add_argument(
+        "--variant",
+        default="holiday4",
+        help=(
+            "Variant name, comma-list, final_production, reduced_model, "
+            "final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all."
+        ),
+    )
     cmd.add_argument(
         "--run-set",
         default="all",
-        help="production, rollout, reduced_model, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
+        help=(
+            "production, rollout, final_production, reduced_model, final_geometry, "
+            "screen_step1, all, or an explicit space/comma-separated run list."
+        ),
     )
     cmd.add_argument("--repo", default=".")
     cmd.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
@@ -801,15 +881,32 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--exact-logs-dir", action="store_true")
     cmd.add_argument("--use-history", action="store_true")
     cmd.add_argument("--save-calibration", action="store_true")
+    cmd.add_argument(
+        "--seed-params-file",
+        default=None,
+        help="Optional per-run prior-candidate JSON evaluated before normal warmups.",
+    )
     cmd.add_argument("--no-clear-queue", action="store_true")
     cmd.set_defaults(func=commands)
 
     launcher = sub.add_parser("launch", help="Start production/hardcase campaign processes in background.")
-    launcher.add_argument("--variant", default="hardcase8", help="Variant name, comma-list, reduced_model, final_geometry, screen_step1, hardcase8, holiday4, holiday5, spatial, global, or all.")
+    launcher.add_argument(
+        "--variant",
+        default="hardcase8",
+        help=(
+            "Variant name, comma-list, final_production, reduced_model, "
+            "final_geometry, screen_step1, hardcase8, holiday4, holiday5, "
+            "spatial, global, or all."
+        ),
+    )
     launcher.add_argument(
         "--run-set",
         default="hardcases",
-        help="production, rollout, hardcases, reduced_model, final_geometry, screen_step1, all, or an explicit space/comma-separated run list.",
+        help=(
+            "production, rollout, hardcases, final_production, reduced_model, "
+            "final_geometry, screen_step1, all, or an explicit "
+            "space/comma-separated run list."
+        ),
     )
     launcher.add_argument(
         "--role",
@@ -846,6 +943,11 @@ def build_parser() -> argparse.ArgumentParser:
     launcher.add_argument("--exact-logs-dir", action="store_true")
     launcher.add_argument("--use-history", action="store_true")
     launcher.add_argument("--save-calibration", action="store_true")
+    launcher.add_argument(
+        "--seed-params-file",
+        default=None,
+        help="Optional per-run prior-candidate JSON evaluated before normal warmups.",
+    )
     launcher.add_argument("--no-clear-queue", action="store_true")
     launcher.add_argument("--dry-run", action="store_true")
     launcher.set_defaults(func=launch)

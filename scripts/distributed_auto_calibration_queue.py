@@ -284,6 +284,79 @@ def _fixed_params_for_run(
     return result
 
 
+def _load_seed_params_file(path: Path) -> Dict[str, List[Dict[str, Any]]]:
+    """Load one or more trusted starting candidates for each run.
+
+    The preferred format is ``{"params_by_run": {"ac20": [{"params": {...}}]}}``.
+    A direct parameter mapping, a list of mappings, or a normal
+    ``final_full_scale_<run>.json`` is also accepted.
+    """
+
+    payload = _load_json(Path(path))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Seed parameter file must contain a JSON object: {path}")
+
+    shared = payload.get("params")
+    if isinstance(shared, dict):
+        return {"*": [dict(shared)]}
+
+    per_run = payload.get("params_by_run", payload)
+    if not isinstance(per_run, dict) or not per_run:
+        raise ValueError(
+            f"Seed parameter file needs 'params' or 'params_by_run': {path}"
+        )
+
+    parsed: Dict[str, List[Dict[str, Any]]] = {}
+    for run, raw_candidates in per_run.items():
+        candidates = (
+            raw_candidates if isinstance(raw_candidates, list) else [raw_candidates]
+        )
+        parsed_candidates: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ValueError(f"Seed candidate for {run!r} is not a JSON object")
+            params = candidate.get("params", candidate)
+            if not isinstance(params, dict) or not params:
+                raise ValueError(f"Seed candidate for {run!r} has no parameters")
+            parsed_candidates.append(dict(params))
+        parsed[str(run).lower()] = parsed_candidates
+    return parsed
+
+
+def _seed_params_for_run(
+    seed_params: Optional[Mapping[str, Sequence[Mapping[str, Any]]]],
+    run: str,
+    param_space: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    if seed_params is None:
+        return []
+    candidates = seed_params.get(run.lower()) or seed_params.get("*")
+    if candidates is None:
+        raise KeyError(f"No seed parameter set found for run {run!r}")
+    return [
+        _fixed_params_for_run({"*": candidate}, run, param_space) or {}
+        for candidate in candidates
+    ]
+
+
+def _merge_unique_params(
+    first: Sequence[Mapping[str, Any]],
+    second: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep candidates ordered while removing exact duplicates."""
+
+    unique: List[Dict[str, Any]] = []
+    seen: set[Tuple[Tuple[str, Any], ...]] = set()
+    for candidate in [*first, *second]:
+        params = dict(candidate)
+        key = tuple(sorted(params.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(params)
+    return unique
+
+
 def _safe_write_json(
     path: Path, payload: dict, attempts: int = 3, delay: float = 0.05
 ) -> bool:
@@ -1645,12 +1718,20 @@ def master_main(args: argparse.Namespace) -> None:
     fixed_params_map = (
         _load_fixed_params_file(Path(fixed_params_file)) if fixed_params_file else None
     )
+    seed_params_file = getattr(args, "seed_params_file", None)
+    seed_params_map = (
+        _load_seed_params_file(Path(seed_params_file)) if seed_params_file else None
+    )
     if fixed_params_map is not None:
         if int(args.max_iters) != 0:
             raise ValueError("--fixed-params-file requires --max-iters 0")
         if args.use_last_best or args.use_history:
             raise ValueError(
                 "--fixed-params-file cannot be combined with --use-last-best or --use-history"
+            )
+        if seed_params_map is not None:
+            raise ValueError(
+                "--fixed-params-file cannot be combined with --seed-params-file"
             )
 
     from darsia.presets.workflows.rig import Rig
@@ -1682,6 +1763,7 @@ def master_main(args: argparse.Namespace) -> None:
         "use_last_best": args.use_last_best,
         "use_history": args.use_history,
         "fixed_params_file": fixed_params_file,
+        "seed_params_file": seed_params_file,
         "bounds_file": args.bounds_file,
         "param_ranges": args.param_ranges,
         "param_levels": args.param_levels,
@@ -1800,6 +1882,11 @@ def master_main(args: argparse.Namespace) -> None:
             run,
             ctx.param_space,
         )
+        seed_params = _seed_params_for_run(
+            seed_params_map,
+            run,
+            ctx.param_space,
+        )
 
         init_params = None
         if args.use_last_best and load_best_params_from_csv is not None and history_source is not None:
@@ -1814,7 +1901,7 @@ def master_main(args: argparse.Namespace) -> None:
                 f"[{run}] fixed evaluation ACTIVE source={fixed_params_file} params={len(fixed_params)}"
             )
         elif args.skip_warmup or ((args.use_last_best or args.use_history) and history_source is not None):
-            warmups = []
+            warmups = seed_params
         else:
             warmups = _generate_warmup_params(
                 ctx,
@@ -1825,6 +1912,12 @@ def master_main(args: argparse.Namespace) -> None:
                 warmup_high=args.warmup_high,
                 warmup_mode=args.warmup_mode,
                 rng=random.Random(run_seed) if run_seed is not None else None,
+            )
+            warmups = _merge_unique_params(seed_params, warmups)
+        if seed_params:
+            _log_master(
+                f"[{run}] prior-candidate seeds ACTIVE source={seed_params_file} "
+                f"candidates={len(seed_params)} total_warmups={len(warmups)}"
             )
         distributions = _build_distributions(ctx.param_space)
         sampler = (
@@ -3404,6 +3497,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluate one frozen parameter set per run and skip Optuna. Accepts a "
              "final_full_scale JSON with top-level 'params', or JSON containing "
              "'params_by_run'. Requires --max-iters 0.",
+    )
+    master.add_argument(
+        "--seed-params-file",
+        default=None,
+        help="Evaluate trusted prior candidates before the structured/random warmups, "
+             "then continue the normal Optuna search. Accepts a final_full_scale JSON "
+             "or a JSON object with one or more candidates under 'params_by_run'.",
     )
     master.add_argument("--bounds-file", default=None)
     master.add_argument("--max-iters", type=int, default=40)

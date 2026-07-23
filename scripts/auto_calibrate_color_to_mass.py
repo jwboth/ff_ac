@@ -1121,7 +1121,9 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                   bounds_map=None, enforce_lower=False, per_label_params=True,
                   use_label_weights=False, label_weights=None, quality_scale=1.0,
                   quality_dtype=None, objective_integral="off",
-                  static_light_correction=None, signal_parameterization=None) -> CalibrationContext:
+                  static_light_correction=None, signal_parameterization=None,
+                  evaluation_times_hours=None,
+                  evaluation_time_tolerance_seconds=600.0) -> CalibrationContext:
     import numpy as np
     signal_parameterization = _normalise_signal_parameterization(signal_parameterization)
     from darsia.presets.workflows.analysis.analysis_context import prepare_analysis_context
@@ -1268,7 +1270,35 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             calibration=cta,
         )
 
-    # preload corrected calibration images + (param-independent) injected mass
+    selected_image_paths = list(ctx_raw.image_paths)
+    if evaluation_times_hours is not None:
+        selected_image_paths = []
+        for requested_time in evaluation_times_hours:
+            path = experiment.find_images_for_times(
+                float(requested_time),
+                tol=float(evaluation_time_tolerance_seconds),
+            )
+            if path is None:
+                raise ValueError(
+                    f"[{run}] no image within {evaluation_time_tolerance_seconds:g} s "
+                    f"of holdout time {float(requested_time):g} h"
+                )
+            selected_image_paths.append(Path(path))
+        if len(set(selected_image_paths)) != len(selected_image_paths):
+            raise ValueError(f"[{run}] holdout times resolved to duplicate image paths")
+        training_paths = {str(Path(path)).lower() for path in ctx_raw.image_paths}
+        overlap = [
+            path
+            for path in selected_image_paths
+            if str(Path(path)).lower() in training_paths
+        ]
+        if overlap:
+            raise ValueError(
+                f"[{run}] holdout selection overlaps calibration frame(s): "
+                + ", ".join(path.name for path in overlap)
+            )
+
+    # preload corrected calibration/holdout images + param-independent injected mass
     loaded: List[Tuple[Any, float, float]] = []
     exp_start = getattr(experiment, "experiment_start", None)
 
@@ -1337,7 +1367,7 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             run,
         )
     else:
-        for p in ctx_raw.image_paths:
+        for p in selected_image_paths:
             img = _select_frame(p)
             if img is None:
                 logger.warning(
@@ -1552,7 +1582,7 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
 
     return CalibrationContext(
         run=run, config=config, experiment=experiment, fluidflower=fluidflower,
-        geometry=geometry, calibration=cta, calibration_images=list(ctx_raw.image_paths),
+        geometry=geometry, calibration=cta, calibration_images=selected_image_paths,
         reference_label=reference_label, signal_label=None, signal_labels=signal_labels,
         param_space=param_space, enforce_lower=enforce_lower,
         per_label_params=per_label_params,
@@ -1650,25 +1680,49 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
 
 def save_best_calibration(context: CalibrationContext, best_params, out_folder=None) -> None:
     import numpy as np
-    if not best_params:
-        logger.warning("[%s] no best params to save", context.run); return
+    if best_params is None:
+        raise ValueError(f"[{context.run}] no best params to save")
+    if context.calibration_folder is None:
+        raise ValueError(f"[{context.run}] calibration folder is not configured")
+
     apply_params(context.calibration, best_params, labels=context.signal_labels, np_module=np)
     folder = Path(context.calibration_folder) / "signal_model"
     folder.mkdir(parents=True, exist_ok=True)
     hetero = context.calibration.signal_model.model[1]
+    failures: List[str] = []
     for label in (hetero.keys() if hasattr(hetero, "keys") else []):
         try:
             hetero[label].save(folder / f"signal_model_{label}")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] could not save signal_model_%s: %s", context.run, label, exc)
+            failures.append(f"signal_model_{label}: {exc}")
     logger.info("[%s] saved optimised signal models to %s", context.run, folder)
-    if out_folder:
+
+    flash = getattr(context.calibration, "flash", None)
+    if flash is None or not hasattr(flash, "save"):
+        failures.append("flash: calibration has no saveable flash model")
+    else:
         try:
-            Path(out_folder).mkdir(parents=True, exist_ok=True)
-            (Path(out_folder) / "best_params.json").write_text(
-                json.dumps(best_params, indent=2, default=str), encoding="utf-8")
-        except Exception:
-            pass
+            flash_path = Path(context.calibration_folder) / "flash" / "flash"
+            flash.save(flash_path)
+            logger.info(
+                "[%s] saved optimised %s to %s",
+                context.run,
+                type(flash).__name__,
+                flash_path.with_suffix(".json"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"flash: {exc}")
+
+    if failures:
+        raise RuntimeError(
+            f"[{context.run}] calibration save failed: " + "; ".join(failures)
+        )
+
+    if out_folder:
+        Path(out_folder).mkdir(parents=True, exist_ok=True)
+        (Path(out_folder) / "best_params.json").write_text(
+            json.dumps(best_params, indent=2, default=str), encoding="utf-8"
+        )
 
 
 # =========================================================================
