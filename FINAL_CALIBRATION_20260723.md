@@ -16,8 +16,9 @@
 - Saved signal and flash models are persistent production outputs.
 
 The nominal campaign contains 79,778 worker evaluations, plus occasional sanity
-evaluations. One master keeps at most 12 runs active and permits two tasks per
-run, filling 24 workers across two machines without holding 24 master contexts.
+evaluations. One master keeps at most 24 runs active and permits exactly one
+task per run, filling 24 workers across two machines without concurrent Optuna
+suggestions for the same experiment.
 
 ## Preparation
 
@@ -29,20 +30,20 @@ cd C:\Users\olav_\Documents\GitHub\ff_ac
 Preparation writes the seed file, a preflight report, launch scripts, and a
 backup of every existing signal/flash calibration under:
 
-`Z:\Albus\Autokalibrering_log\final_production_20260723`
+`Z:\Albus\Autokalibrering_log\final_production_20260723_24x1`
 
 ## Launch
 
 Primary machine (one master and 12 workers):
 
 ```powershell
-& 'Z:\Albus\Autokalibrering_log\final_production_20260723\start_master_and_12_workers.ps1'
+& 'Z:\Albus\Autokalibrering_log\final_production_20260723_24x1\start_master_and_12_workers.ps1'
 ```
 
 Second machine (12 workers):
 
 ```powershell
-& 'Z:\Albus\Autokalibrering_log\final_production_20260723\start_12_workers.ps1'
+& 'Z:\Albus\Autokalibrering_log\final_production_20260723_24x1\start_12_workers.ps1'
 ```
 
 ## Held-out validation

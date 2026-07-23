@@ -114,6 +114,8 @@ FINAL_EXCLUDED_RUNS = {
     "ac29": "physical/chemical outlier with low-pH yellow initial state",
     "ac51": "physical/chemical outlier with low-pH yellow initial state",
 }
+FINAL_MAX_ACTIVE_RUNS = 24
+FINAL_MAX_IN_FLIGHT_PER_RUN = 1
 
 FINAL_PRODUCTION_RUNS = [
     # Put the six fully screened runs first so the first completed batch is informative.
@@ -481,6 +483,15 @@ def _validate_final_campaign(
         raise SystemExit(
             "The persistent final variant requires --max-iters 1600 "
             "--warmup-iters 150."
+        )
+    if (
+        int(args.max_active_runs) != FINAL_MAX_ACTIVE_RUNS
+        or int(args.max_in_flight_per_run) != FINAL_MAX_IN_FLIGHT_PER_RUN
+    ):
+        raise SystemExit(
+            "The persistent final variant requires --max-active-runs "
+            f"{FINAL_MAX_ACTIVE_RUNS} --max-in-flight-per-run "
+            f"{FINAL_MAX_IN_FLIGHT_PER_RUN}."
         )
     if not args.seed_params_file:
         raise SystemExit(

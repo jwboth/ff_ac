@@ -18,19 +18,31 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .ac_production_campaign import FINAL_EXCLUDED_RUNS, FINAL_PRODUCTION_RUNS
+    from .ac_production_campaign import (
+        FINAL_EXCLUDED_RUNS,
+        FINAL_MAX_ACTIVE_RUNS,
+        FINAL_MAX_IN_FLIGHT_PER_RUN,
+        FINAL_PRODUCTION_RUNS,
+    )
     from .auto_calibrate_color_to_mass import build_param_space, load_bounds_map
 except ImportError:
-    from ac_production_campaign import FINAL_EXCLUDED_RUNS, FINAL_PRODUCTION_RUNS
+    from ac_production_campaign import (
+        FINAL_EXCLUDED_RUNS,
+        FINAL_MAX_ACTIVE_RUNS,
+        FINAL_MAX_IN_FLIGHT_PER_RUN,
+        FINAL_PRODUCTION_RUNS,
+    )
     from auto_calibrate_color_to_mass import build_param_space, load_bounds_map
 
 
 DEFAULT_OUTPUT_ROOT = Path(
-    r"Z:\Albus\Autokalibrering_log\final_production_20260723"
+    r"Z:\Albus\Autokalibrering_log\final_production_20260723_24x1"
 )
 DEFAULT_RESULTS_ROOT = Path(r"Z:\Albus\Results")
 DEFAULT_BOUNDS = Path("config/bounds_seg6_titration.json")
-DEFAULT_QUEUE_ROOT = r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_final_20260723"
+DEFAULT_QUEUE_ROOT = (
+    r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_final_20260723_24x1"
+)
 ACTIVE_LABELS = [1, 2, 5, 7, 8]
 
 
@@ -303,8 +315,8 @@ def _write_launch_script(
         _ps_quote(output_root),
         "--max-iters 1600",
         "--warmup-iters 150",
-        "--max-active-runs 12",
-        "--max-in-flight-per-run 2",
+        f"--max-active-runs {FINAL_MAX_ACTIVE_RUNS}",
+        f"--max-in-flight-per-run {FINAL_MAX_IN_FLIGHT_PER_RUN}",
         "--total-workers 12",
         "--max-tasks-per-worker 250",
         "--idle-exit-seconds 120",

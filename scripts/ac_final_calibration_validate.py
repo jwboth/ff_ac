@@ -28,7 +28,7 @@ except ImportError:
 
 
 DEFAULT_LOGS = Path(
-    r"Z:\Albus\Autokalibrering_log\final_production_20260723"
+    r"Z:\Albus\Autokalibrering_log\final_production_20260723_24x1"
     r"\final_production_titration_ac14_seed17"
 )
 DEFAULT_TIMES = [4.1, 6.0, 8.0]

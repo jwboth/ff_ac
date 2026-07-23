@@ -11,10 +11,13 @@ from darsia.multiphase.flash import SimpleFlash, TitrationFlash
 from scripts.ac_final_calibration_prepare import _project_candidate
 from scripts.ac_production_campaign import (
     FINAL_EXCLUDED_RUNS,
+    FINAL_MAX_ACTIVE_RUNS,
+    FINAL_MAX_IN_FLIGHT_PER_RUN,
     FINAL_PRODUCTION_RUNS,
     _common_master_args,
     _select_runs,
     _select_variants,
+    _validate_final_campaign,
     build_parser as build_campaign_parser,
 )
 from scripts.auto_calibrate_color_to_mass import save_best_calibration
@@ -164,8 +167,13 @@ def test_final_campaign_is_full_model_persistent_and_excludes_outliers(tmp_path)
             "150",
             "--seed-params-file",
             str(seed_path),
+            "--max-active-runs",
+            str(FINAL_MAX_ACTIVE_RUNS),
+            "--max-in-flight-per-run",
+            str(FINAL_MAX_IN_FLIGHT_PER_RUN),
         ]
     )
+    _validate_final_campaign(args, variants, runs)
     command = _common_master_args(
         args,
         variant,
@@ -176,3 +184,43 @@ def test_final_campaign_is_full_model_persistent_and_excludes_outliers(tmp_path)
     assert "--no-save-calibration" not in command
     assert command[command.index("--seed-params-file") + 1] == f"'{seed_path}'"
     assert command[command.index("--max-iters") + 1] == "1600"
+    assert (
+        command[command.index("--max-active-runs") + 1]
+        == str(FINAL_MAX_ACTIVE_RUNS)
+    )
+    assert (
+        command[command.index("--max-in-flight-per-run") + 1]
+        == str(FINAL_MAX_IN_FLIGHT_PER_RUN)
+    )
+
+
+def test_final_campaign_rejects_concurrent_trials_for_the_same_run(tmp_path):
+    seed_path = tmp_path / "seeds.json"
+    seed_path.write_text("{}", encoding="utf-8")
+    variants = _select_variants("final_production")
+    args = build_campaign_parser().parse_args(
+        [
+            "launch",
+            "--variant",
+            "final_production",
+            "--run-set",
+            "final_production",
+            "--max-iters",
+            "1600",
+            "--warmup-iters",
+            "150",
+            "--max-active-runs",
+            "12",
+            "--max-in-flight-per-run",
+            "2",
+            "--seed-params-file",
+            str(seed_path),
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="max-active-runs 24"):
+        _validate_final_campaign(
+            args,
+            variants,
+            _select_runs("final_production"),
+        )
