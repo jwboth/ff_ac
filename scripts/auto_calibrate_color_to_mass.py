@@ -1126,7 +1126,10 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                   evaluation_time_tolerance_seconds=600.0) -> CalibrationContext:
     import numpy as np
     signal_parameterization = _normalise_signal_parameterization(signal_parameterization)
-    from darsia.presets.workflows.analysis.analysis_context import prepare_analysis_context
+    from darsia.presets.workflows.analysis.analysis_context import (
+        prepare_analysis_context,
+        select_image_paths,
+    )
 
     config_dir = Path(config_dir)
     config_path = config_dir / f"{run}.toml"
@@ -1270,7 +1273,63 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             calibration=cta,
         )
 
+    # Calibration image selection belongs to [calibration.mass], independently
+    # of the image schedule used by subsequent analyses. Historically this used
+    # ctx_raw.image_paths ([analysis].data), which made additions to the declared
+    # mass-calibration schedule ineffective.
     selected_image_paths = list(ctx_raw.image_paths)
+    calibration_mass_config = getattr(
+        getattr(config, "calibration", None),
+        "mass",
+        None,
+    )
+    if calibration_mass_config is not None:
+        mass_data = getattr(calibration_mass_config, "data", None)
+        if hasattr(mass_data, "get_times_with_uncertainty"):
+            selected_image_paths = list(
+                experiment.find_images_for_paths(
+                    paths=list(getattr(mass_data, "image_paths", []) or [])
+                )
+            )
+            for requested_time, tolerance_hours in (
+                mass_data.get_times_with_uncertainty()
+            ):
+                path = experiment.find_images_for_times(
+                    float(requested_time),
+                    tol=float(tolerance_hours) * 3600.0,
+                )
+                if path is None:
+                    logger.warning(
+                        "[%s] no calibration image within %.1f min of %.3f h; "
+                        "dropping this unavailable point",
+                        run,
+                        float(tolerance_hours) * 60.0,
+                        float(requested_time),
+                    )
+                    continue
+                path = Path(path)
+                if path in selected_image_paths:
+                    logger.warning(
+                        "[%s] calibration time %.3f h resolves to duplicate %s; "
+                        "keeping the image only once",
+                        run,
+                        float(requested_time),
+                        path.name,
+                    )
+                    continue
+                selected_image_paths.append(path)
+            selected_image_paths.sort(key=experiment.get_datetime)
+        else:
+            selected_image_paths = select_image_paths(
+                config,
+                experiment,
+                all=False,
+                sub_config=calibration_mass_config,
+                data_registry=config.data.registry,
+            )
+    if not selected_image_paths:
+        raise ValueError(f"[{run}] no mass-calibration images were resolved")
+    training_image_paths = list(selected_image_paths)
     if evaluation_times_hours is not None:
         selected_image_paths = []
         for requested_time in evaluation_times_hours:
@@ -1286,7 +1345,9 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
             selected_image_paths.append(Path(path))
         if len(set(selected_image_paths)) != len(selected_image_paths):
             raise ValueError(f"[{run}] holdout times resolved to duplicate image paths")
-        training_paths = {str(Path(path)).lower() for path in ctx_raw.image_paths}
+        training_paths = {
+            str(Path(path)).lower() for path in training_image_paths
+        }
         overlap = [
             path
             for path in selected_image_paths
@@ -1304,7 +1365,7 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
 
     # Nearest-good-neighbour substitution. read_image applies the rig corrections incl.
     # ColorCorrection, which sets last_flagged when a frame's lighting/checker is too far
-    # gone to recover. For CALIBRATION we only need ~13 well-spread points, not these exact
+    # gone to recover. For calibration we need sparse, well-spread points, not these exact
     # frames, so a flagged frame is replaced by the nearest-in-time correctable neighbour
     # (frames are ~5 min apart and the CO2 state barely changes over a few minutes). If no
     # neighbour within the window is usable, the calibration point is dropped. When colour

@@ -12,6 +12,7 @@ import hashlib
 import json
 import shutil
 import sys
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ try:
         FINAL_MAX_ACTIVE_RUNS,
         FINAL_MAX_IN_FLIGHT_PER_RUN,
         FINAL_PRODUCTION_RUNS,
+        FINAL_VARIANT_NAME,
     )
     from .auto_calibrate_color_to_mass import build_param_space, load_bounds_map
 except ImportError:
@@ -31,19 +33,23 @@ except ImportError:
         FINAL_MAX_ACTIVE_RUNS,
         FINAL_MAX_IN_FLIGHT_PER_RUN,
         FINAL_PRODUCTION_RUNS,
+        FINAL_VARIANT_NAME,
     )
     from auto_calibrate_color_to_mass import build_param_space, load_bounds_map
 
 
 DEFAULT_OUTPUT_ROOT = Path(
-    r"Z:\Albus\Autokalibrering_log\final_production_20260723_24x1"
+    r"Z:\Albus\Autokalibrering_log\final_production_20260723_16frames_24x1"
 )
 DEFAULT_RESULTS_ROOT = Path(r"Z:\Albus\Results")
 DEFAULT_BOUNDS = Path("config/bounds_seg6_titration.json")
 DEFAULT_QUEUE_ROOT = (
-    r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_final_20260723_24x1"
+    r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_final_20260723_16frames_24x1"
 )
 ACTIVE_LABELS = [1, 2, 5, 7, 8]
+FINAL_CALIBRATION_POINT_COUNT = 16
+REQUIRED_REDISTRIBUTION_TIMES_H = (4.1, 6.0, 8.0)
+HOLDOUT_TIMES_H = (3.5, 7.0, 12.0)
 
 
 @dataclass(frozen=True)
@@ -208,6 +214,7 @@ def _preflight_run(
         config_root / ".titration_state" / f"{run}.txt"
     )
     expected_color = "off" if run == "ac44" else "on"
+    frame_selection = _preflight_frame_selection(repo, run)
     checks = {
         "config": (config_root / f"{run}.toml").exists(),
         "results": result.exists(),
@@ -226,6 +233,8 @@ def _preflight_run(
         "color_state": color_state == expected_color,
         "titration_state": titration_state == "on",
         "seed_candidates": candidate_count > 0,
+        "redistribution_frames": frame_selection["redistribution_ok"],
+        "holdout_frames": frame_selection["holdout_ok"],
     }
     return {
         "run": run,
@@ -235,6 +244,78 @@ def _preflight_run(
         "expected_color_state": expected_color,
         "titration_state": titration_state,
         "seed_candidates": candidate_count,
+        "frame_selection": frame_selection,
+    }
+
+
+def _preflight_frame_selection(repo: Path, run: str) -> dict[str, Any]:
+    import darsia
+    from darsia.presets.workflows.config.fluidflower_config import (
+        FluidFlowerConfig,
+    )
+
+    paths = [
+        repo / "config_seg6" / "common.toml",
+        repo / "config_seg6" / "run_ac" / f"{run}.toml",
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        config = FluidFlowerConfig(
+            paths,
+            require_results=True,
+            require_data=True,
+        )
+    experiment = darsia.ProtocolledExperiment.init_from_config(config)
+    mass_data = config.calibration.mass.data
+    selected_paths: list[Path] = []
+    selected_times: list[float] = []
+    missing_times: list[float] = []
+    resolved_by_request: dict[float, Path | None] = {}
+    for requested_time, tolerance_hours in (
+        mass_data.get_times_with_uncertainty()
+    ):
+        path = experiment.find_images_for_times(
+            float(requested_time),
+            tol=float(tolerance_hours) * 3600.0,
+        )
+        resolved_by_request[float(requested_time)] = (
+            Path(path) if path is not None else None
+        )
+        if path is None:
+            missing_times.append(float(requested_time))
+            continue
+        path = Path(path)
+        if path in selected_paths:
+            continue
+        selected_paths.append(path)
+        selected_times.append(
+            float(experiment.time_since_start(experiment.get_datetime(path)))
+        )
+
+    redistribution_ok = all(
+        any(
+            abs(requested - required) < 1e-9 and path is not None
+            for requested, path in resolved_by_request.items()
+        )
+        for required in REQUIRED_REDISTRIBUTION_TIMES_H
+    )
+    holdout_paths = [
+        experiment.find_images_for_times(value, tol=600.0)
+        for value in HOLDOUT_TIMES_H
+    ]
+    resolved_holdouts = [Path(path) for path in holdout_paths if path is not None]
+    holdout_ok = (
+        len(resolved_holdouts) == len(HOLDOUT_TIMES_H)
+        and len(set(resolved_holdouts)) == len(HOLDOUT_TIMES_H)
+        and not set(resolved_holdouts).intersection(selected_paths)
+    )
+    return {
+        "calibration_frame_count": len(selected_paths),
+        "calibration_actual_times_h": selected_times,
+        "missing_requested_times_h": missing_times,
+        "redistribution_ok": redistribution_ok,
+        "holdout_times_h": HOLDOUT_TIMES_H,
+        "holdout_ok": holdout_ok,
     }
 
 
@@ -294,6 +375,27 @@ def _ps_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _configured_calibration_times(repo: Path) -> list[float]:
+    from darsia.presets.workflows.config.fluidflower_config import (
+        FluidFlowerConfig,
+    )
+
+    paths = [
+        repo / "config_seg6" / "common.toml",
+        repo / "config_seg6" / "run_ac" / "ac20.toml",
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        config = FluidFlowerConfig(
+            paths,
+            require_results=True,
+            require_data=True,
+        )
+    mass_config = getattr(getattr(config, "calibration", None), "mass", None)
+    time_data = getattr(mass_config, "data", None)
+    return sorted(float(value) for value in (time_data.image_times or []))
+
+
 def _write_launch_script(
     *,
     path: Path,
@@ -341,6 +443,38 @@ def _write_launch_script(
     )
 
 
+def _write_stop_script(
+    *,
+    path: Path,
+    repo: Path,
+    queue_root: str,
+) -> None:
+    base_queue = queue_root.rstrip("\\/")
+    queue = f"{base_queue}_{FINAL_VARIANT_NAME}"
+    arguments = [
+        "& .\\.venv\\Scripts\\python.exe",
+        "scripts/stop_ac_calibration_campaign.py",
+        "--marker",
+        _ps_quote(Path(queue).name),
+        "--queue",
+        _ps_quote(queue),
+        "--timeout 30",
+    ]
+    path.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                f"Set-Location {_ps_quote(repo)}",
+                " ".join(arguments),
+                "if ($LASTEXITCODE -ne 0) { "
+                "throw \"Campaign stop failed with exit code $LASTEXITCODE\" }",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def prepare(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
     output_root = Path(args.output_root)
@@ -355,6 +489,17 @@ def prepare(args: argparse.Namespace) -> None:
         )
     if set(FINAL_EXCLUDED_RUNS).intersection(FINAL_PRODUCTION_RUNS):
         raise RuntimeError("An excluded run leaked into FINAL_PRODUCTION_RUNS")
+
+    calibration_times = _configured_calibration_times(repo)
+    missing_required_times = [
+        value
+        for value in REQUIRED_REDISTRIBUTION_TIMES_H
+        if not any(abs(value - actual) < 1e-9 for actual in calibration_times)
+    ]
+    schedule_ok = (
+        len(calibration_times) == FINAL_CALIBRATION_POINT_COUNT
+        and not missing_required_times
+    )
 
     param_space = _parameter_space(bounds_file)
     params_by_run: dict[str, list[dict[str, Any]]] = {}
@@ -379,6 +524,8 @@ def prepare(args: argparse.Namespace) -> None:
     failures = [row["run"] for row in preflight_rows if not row["ok"]]
     if not template_path.exists():
         failures.append("ac14_template")
+    if not schedule_ok:
+        failures.append("calibration_schedule")
 
     output_root.mkdir(parents=True, exist_ok=True)
     backup_root, backup_rows = _backup_current_calibrations(
@@ -392,8 +539,10 @@ def prepare(args: argparse.Namespace) -> None:
             "created_at_utc": _utc_now(),
             "method": (
                 "full per-label TitrationFlash, strict AC14 partial-affine, "
-                "point-wise L1"
+                "equal-weight point-wise L1 over up to 16 frames"
             ),
+            "calibration_times_h": calibration_times,
+            "frame_weighting": "equal",
             "bounds_file": str(bounds_file),
             "parameter_count": len(param_space),
             "run_count": len(FINAL_PRODUCTION_RUNS),
@@ -410,6 +559,7 @@ def prepare(args: argparse.Namespace) -> None:
     )
     local_launcher = output_root / "start_master_and_12_workers.ps1"
     watchdog_launcher = output_root / "start_12_workers.ps1"
+    stop_launcher = output_root / "stop_campaign_on_this_machine.ps1"
     _write_launch_script(
         path=local_launcher,
         repo=repo,
@@ -426,10 +576,19 @@ def prepare(args: argparse.Namespace) -> None:
         seed_path=seed_path,
         role="watchdog",
     )
+    _write_stop_script(
+        path=stop_launcher,
+        repo=repo,
+        queue_root=args.queue_root,
+    )
     preflight_payload = {
         "created_at_utc": _utc_now(),
         "ok": not failures,
         "run_count": len(FINAL_PRODUCTION_RUNS),
+        "calibration_point_count": len(calibration_times),
+        "calibration_times_h": calibration_times,
+        "required_redistribution_times_h": REQUIRED_REDISTRIBUTION_TIMES_H,
+        "calibration_schedule_ok": schedule_ok,
         "template_path": str(template_path),
         "template_exists": template_path.exists(),
         "failed": failures,
@@ -441,12 +600,23 @@ def prepare(args: argparse.Namespace) -> None:
     )
 
     counts = [len(params_by_run[run]) for run in FINAL_PRODUCTION_RUNS]
+    frame_counts: dict[int, int] = {}
+    for row in preflight_rows:
+        count = int(row["frame_selection"]["calibration_frame_count"])
+        frame_counts[count] = frame_counts.get(count, 0) + 1
     print(f"Final runs: {len(FINAL_PRODUCTION_RUNS)}")
     print(f"Excluded: {', '.join(FINAL_EXCLUDED_RUNS)}")
     print(
         "Prior candidates per run: "
         f"min={min(counts)}, median={sorted(counts)[len(counts) // 2]}, "
         f"max={max(counts)}, total={sum(counts)}"
+    )
+    print(
+        "Available calibration frames per run: "
+        + ", ".join(
+            f"{count} frames={runs} run(s)"
+            for count, runs in sorted(frame_counts.items())
+        )
     )
     print(f"Seed file: {seed_path}")
     print(f"Preflight: {preflight_path}")
@@ -456,6 +626,7 @@ def prepare(args: argparse.Namespace) -> None:
     )
     print(f"Primary launcher: {local_launcher}")
     print(f"Second-machine launcher: {watchdog_launcher}")
+    print(f"Stop launcher (run on each machine): {stop_launcher}")
     if failures:
         raise SystemExit("Preflight failed for: " + ", ".join(failures))
     print("Preflight OK.")

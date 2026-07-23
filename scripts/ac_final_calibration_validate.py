@@ -1,4 +1,4 @@
-"""Evaluate final AC calibrations on held-out 4.1, 6, and 8 hour frames."""
+"""Evaluate final AC calibrations on held-out 3.5, 7, and 12 hour frames."""
 
 from __future__ import annotations
 
@@ -28,10 +28,10 @@ except ImportError:
 
 
 DEFAULT_LOGS = Path(
-    r"Z:\Albus\Autokalibrering_log\final_production_20260723_24x1"
+    r"Z:\Albus\Autokalibrering_log\final_production_20260723_16frames_24x1"
     r"\final_production_titration_ac14_seed17"
 )
-DEFAULT_TIMES = [4.1, 6.0, 8.0]
+DEFAULT_TIMES = [3.5, 7.0, 12.0]
 
 
 def _selected_runs(spec: str) -> list[str]:
@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logs-dir", default=str(DEFAULT_LOGS))
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--runs", default="final")
-    parser.add_argument("--times", default="4.1 6 8")
+    parser.add_argument("--times", default="3.5 7 12")
     parser.add_argument("--tolerance-minutes", type=float, default=10.0)
     parser.add_argument(
         "--bounds-file",

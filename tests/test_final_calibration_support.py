@@ -8,23 +8,34 @@ import numpy as np
 import pytest
 
 from darsia.multiphase.flash import SimpleFlash, TitrationFlash
-from scripts.ac_final_calibration_prepare import _project_candidate
+from scripts.ac_final_calibration_prepare import (
+    FINAL_CALIBRATION_POINT_COUNT,
+    REQUIRED_REDISTRIBUTION_TIMES_H,
+    _configured_calibration_times,
+    _project_candidate,
+)
 from scripts.ac_production_campaign import (
     FINAL_EXCLUDED_RUNS,
     FINAL_MAX_ACTIVE_RUNS,
     FINAL_MAX_IN_FLIGHT_PER_RUN,
     FINAL_PRODUCTION_RUNS,
+    FINAL_VARIANT_NAME,
     _common_master_args,
     _select_runs,
     _select_variants,
     _validate_final_campaign,
     build_parser as build_campaign_parser,
 )
-from scripts.auto_calibrate_color_to_mass import save_best_calibration
+from scripts import auto_calibrate_color_to_mass
+from scripts.auto_calibrate_color_to_mass import evaluate_run, save_best_calibration
 from scripts.distributed_auto_calibration_queue import (
     _load_seed_params_file,
     _merge_unique_params,
     _seed_params_for_run,
+)
+from scripts.stop_ac_calibration_campaign import (
+    ProcessRecord,
+    _expand_target_pids,
 )
 
 
@@ -148,6 +159,7 @@ def test_final_campaign_is_full_model_persistent_and_excludes_outliers(tmp_path)
     assert not set(FINAL_EXCLUDED_RUNS).intersection(runs)
     assert len(variants) == 1
     variant = variants[0]
+    assert variant.name == FINAL_VARIANT_NAME
     assert variant.signal_parameterization == "per-label"
     assert variant.template_registration == "ac14_template"
     assert variant.template_strict
@@ -192,6 +204,73 @@ def test_final_campaign_is_full_model_persistent_and_excludes_outliers(tmp_path)
         command[command.index("--max-in-flight-per-run") + 1]
         == str(FINAL_MAX_IN_FLIGHT_PER_RUN)
     )
+
+
+def test_final_mass_calibration_schedule_contains_16_equal_weight_frames():
+    repo = Path(__file__).resolve().parents[1]
+    times = _configured_calibration_times(repo)
+
+    assert len(times) == FINAL_CALIBRATION_POINT_COUNT
+    for expected in REQUIRED_REDISTRIBUTION_TIMES_H:
+        assert any(actual == pytest.approx(expected) for actual in times)
+
+
+def test_pointwise_l1_uses_equal_absolute_weight_per_frame(monkeypatch):
+    monkeypatch.setattr(
+        auto_calibrate_color_to_mass,
+        "apply_params",
+        lambda *args, **kwargs: None,
+    )
+    calibration = lambda detected: SimpleNamespace(mass=detected)
+    context = SimpleNamespace(
+        _loaded=[
+            (1.0, 0.0, 1.0),
+            (5.0, 3.0, 2.0),
+            (7.0, 10.0, 3.0),
+        ],
+        calibration=calibration,
+        geometry=SimpleNamespace(integrate=float),
+        enforce_lower=False,
+        objective_integral="off",
+        signal_labels=[],
+    )
+
+    result = evaluate_run(context, {})
+
+    assert result.status == "ok"
+    assert result.objective == pytest.approx(1.0 + 2.0 + 3.0)
+
+
+def test_campaign_stop_expands_tree_and_recorded_orphan_spawn():
+    marker = "Kalibrering_AC_final_test"
+    records = {
+        10: ProcessRecord(10, 1, "powershell.exe", marker, 1.0),
+        11: ProcessRecord(11, 10, "python.exe", "master", 2.0),
+        12: ProcessRecord(
+            12,
+            11,
+            "python.exe",
+            "spawn_main(parent_pid=11) --multiprocessing-fork",
+            3.0,
+        ),
+        20: ProcessRecord(
+            20,
+            1,
+            "python.exe",
+            "spawn_main(parent_pid=99) --multiprocessing-fork",
+            4.0,
+        ),
+        30: ProcessRecord(30, 1, "python.exe", "unrelated.py", 5.0),
+    }
+
+    targets = _expand_target_pids(
+        records,
+        marker,
+        recorded_watchdog_pids={99},
+        excluded_pids=set(),
+    )
+
+    assert targets == {10, 11, 12, 20}
 
 
 def test_final_campaign_rejects_concurrent_trials_for_the_same_run(tmp_path):

@@ -114,6 +114,7 @@ FINAL_EXCLUDED_RUNS = {
     "ac29": "physical/chemical outlier with low-pH yellow initial state",
     "ac51": "physical/chemical outlier with low-pH yellow initial state",
 }
+FINAL_VARIANT_NAME = "final_production_titration_ac14_seed17"
 FINAL_MAX_ACTIVE_RUNS = 24
 FINAL_MAX_IN_FLIGHT_PER_RUN = 1
 
@@ -308,7 +309,7 @@ VARIANTS = [
         note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 73",
     ),
     Variant(
-        "final_production_titration_ac14_seed17",
+        FINAL_VARIANT_NAME,
         "off",
         "off",
         template_registration="ac14_template",
@@ -405,7 +406,7 @@ VARIANT_SETS = {
         "reduced_template_ac14_seed73",
     ],
     "final_production": [
-        "final_production_titration_ac14_seed17",
+        FINAL_VARIANT_NAME,
     ],
     "all": [variant.name for variant in VARIANTS],
 }
@@ -472,7 +473,7 @@ def _validate_final_campaign(
 ) -> None:
     if not any(variant.save_calibration for variant in selected):
         return
-    if len(selected) != 1 or selected[0].name != "final_production_titration_ac14_seed17":
+    if len(selected) != 1 or selected[0].name != FINAL_VARIANT_NAME:
         raise SystemExit("The persistent final variant must run by itself.")
     if runs != FINAL_PRODUCTION_RUNS:
         raise SystemExit(
@@ -815,7 +816,15 @@ def launch(args: argparse.Namespace) -> None:
                 dry_run=args.dry_run,
             )
             if pid is not None:
-                launched.append({"variant": variant.name, "role": "master", "pid": pid, "log": str(master_log)})
+                launched.append(
+                    {
+                        "variant": variant.name,
+                        "role": "master",
+                        "hostname": hostname,
+                        "pid": pid,
+                        "log": str(master_log),
+                    }
+                )
         if start_watchdog:
             watchdog_env = _variant_env(os.environ, variant, master=False, spatial_sigma=args.spatial_sigma)
             watchdog_log = variant_log_dir / f"launcher_watchdog_{hostname}.log"
@@ -828,7 +837,15 @@ def launch(args: argparse.Namespace) -> None:
                 dry_run=args.dry_run,
             )
             if pid is not None:
-                launched.append({"variant": variant.name, "role": "watchdog", "pid": pid, "log": str(watchdog_log)})
+                launched.append(
+                    {
+                        "variant": variant.name,
+                        "role": "watchdog",
+                        "hostname": hostname,
+                        "pid": pid,
+                        "log": str(watchdog_log),
+                    }
+                )
         print()
 
     if args.dry_run:
@@ -837,7 +854,10 @@ def launch(args: argparse.Namespace) -> None:
 
     manifest_root = Path(args.logs_root)
     manifest_root.mkdir(parents=True, exist_ok=True)
-    manifest = manifest_root / f"launcher_processes_{args.role}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    manifest = manifest_root / (
+        f"launcher_processes_{args.role}_{hostname}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
     manifest.write_text(json.dumps(launched, indent=2), encoding="utf-8")
     print(f"Started {len(launched)} process(es).")
     print(f"Process manifest: {manifest}")

@@ -144,6 +144,10 @@ end = "12:00:00"
 num = 5
 tol = "00:05:00"
 
+[data.time.calibration_early_redistribution]
+times = ["04:06:00", "06:00:00", "08:00:00"]
+tol = "00:15:00"
+
 [data.interval.injection]
 start = "00:00:00"
 end = "02:30:00"
@@ -218,7 +222,7 @@ color = "relative_colorpath"
 
 [calibration.mass]
 color = "relative_colorpath"
-data = ["calibration1", "calibration2"]
+data = ["calibration1", "calibration2", "calibration_early_redistribution"]
 rois = ["injection1", "injection2"]
 
 ######################################################
