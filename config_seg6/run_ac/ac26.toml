@@ -56,6 +56,11 @@ end = "96:00:00"
 num = 10
 tol = "08:00:00"
 
+# AC26 recording ends at about 47 h 40 min. Keep the common 48 h
+# calibration target, but accept this final available frame for this run only.
+[data.interval.calibration2]
+tol = "00:30:00"
+
 [protocols]
 injection = "protocols/ac26/injection_protocol.csv"
 pressure_temperature = "protocols/ac26/pressure_temperature_protocol.csv"

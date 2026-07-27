@@ -63,6 +63,8 @@ imaging_mode = "ctime"
 
 [protocols.imaging]
 "\\\\UNAS-Pro-8\\UiB_FluidFlower\\Albus\\Raw data\\AC61\\230711_101200_AC61_injection_30s" = "protocols/ac61/imaging_protocol_inj.csv"
+# The raw folder name says 230710, but EXIF timestamps show that the resting
+# sequence starts on 2023-07-11. The mapped CSV is therefore corrected by +1 day.
 "\\\\UNAS-Pro-8\\UiB_FluidFlower\\Albus\\Raw data\\AC61\\230710_132310_AC61_resting_5min" = "protocols/ac61/imaging_protocol_rest.csv"
 
 [labeling]

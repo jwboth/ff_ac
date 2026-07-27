@@ -110,6 +110,20 @@ FINAL_GEOMETRY_RUNS = [
     "ac60",
 ]
 
+PHASE_SCREEN_RUNS = [
+    "ac20",  # well-calibrated early control
+    "ac60",  # AC60/template-era control
+    "ac24",  # early under-detection followed by late inflation
+    "ac32",  # early under-detection followed by late inflation
+    "ac26",  # persistent hard case with measured-depth history
+    "ac27",  # persistent hard case with measured-depth history
+]
+PHASE_SCREEN_VARIANTS = [
+    "phase_control_titration",
+    "phase_sharedpath_balanced",
+    "phase_residualgas_balanced",
+]
+
 FINAL_EXCLUDED_RUNS = {
     "ac29": "physical/chemical outlier with low-pH yellow initial state",
     "ac51": "physical/chemical outlier with low-pH yellow initial state",
@@ -141,6 +155,9 @@ class Variant:
     template_strict: bool = False
     static_reference: str = "median"
     signal_parameterization: str = "per-label"
+    color_path_anchor: str = "off"
+    color_path_anchor_weight: float = 0.75
+    phase_separation: str = "shared-signal"
     optuna_seed: int | None = None
     save_calibration: bool = False
     note: str = ""
@@ -322,6 +339,47 @@ VARIANTS = [
         ),
     ),
     Variant(
+        "phase_control_titration",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        note=(
+            "corrected-depth control: current per-run color paths, TitrationFlash, "
+            "and equal point-wise L1"
+        ),
+    ),
+    Variant(
+        "phase_sharedpath_balanced",
+        "window-balanced",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        optuna_seed=17,
+        note=(
+            "AC60-regularized relative color-path shape plus equal I1/I2/early/late "
+            "objective weighting"
+        ),
+    ),
+    Variant(
+        "phase_residualgas_balanced",
+        "window-balanced",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        phase_separation="residual-gas",
+        optuna_seed=17,
+        note=(
+            "regularized aqueous titration plus independent off-path optical "
+            "residual for gas saturation"
+        ),
+    ),
+    Variant(
         "titration_static_spatial_drift025",
         "drift:0.25",
         "blue-spatial",
@@ -408,6 +466,9 @@ VARIANT_SETS = {
     "final_production": [
         FINAL_VARIANT_NAME,
     ],
+    "phase_screen": [
+        *PHASE_SCREEN_VARIANTS,
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -458,6 +519,8 @@ def _select_runs(run_set: str) -> list[str]:
         return FINAL_GEOMETRY_RUNS
     if run_set == "final_production":
         return FINAL_PRODUCTION_RUNS
+    if run_set == "phase_screen":
+        return PHASE_SCREEN_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
@@ -471,6 +534,31 @@ def _validate_final_campaign(
     selected: list[Variant],
     runs: list[str],
 ) -> None:
+    selected_names = [variant.name for variant in selected]
+    if any(name in PHASE_SCREEN_VARIANTS for name in selected_names):
+        if selected_names != PHASE_SCREEN_VARIANTS or runs != PHASE_SCREEN_RUNS:
+            raise SystemExit(
+                "The phase screen requires --variant phase_screen "
+                "--run-set phase_screen."
+            )
+        if int(args.max_iters) != 800 or int(args.warmup_iters) != 150:
+            raise SystemExit(
+                "The phase screen requires --max-iters 800 --warmup-iters 150."
+            )
+        if (
+            int(args.max_active_runs) != len(PHASE_SCREEN_RUNS)
+            or int(args.max_in_flight_per_run) != 1
+        ):
+            raise SystemExit(
+                "The phase screen requires --max-active-runs 6 "
+                "--max-in-flight-per-run 1."
+            )
+        if not args.seed_params_file or not Path(args.seed_params_file).exists():
+            raise SystemExit(
+                "The phase screen requires --seed-params-file from "
+                "scripts/prepare_ac_phase_screen.py."
+            )
+        return
     if not any(variant.save_calibration for variant in selected):
         return
     if len(selected) != 1 or selected[0].name != FINAL_VARIANT_NAME:
@@ -538,6 +626,25 @@ def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
         )
     else:
         lines.append("Remove-Item Env:\\FFAC_SIGNAL_PARAMETERIZATION -ErrorAction SilentlyContinue")
+    if variant.color_path_anchor != "off":
+        lines.append(
+            f"$env:FFAC_COLOR_PATH_ANCHOR = '{variant.color_path_anchor}'"
+        )
+        lines.append(
+            "$env:FFAC_COLOR_PATH_ANCHOR_WEIGHT = "
+            f"'{variant.color_path_anchor_weight:g}'"
+        )
+        lines.append("$env:FFAC_COLOR_PATH_ANCHOR_STRICT = 'on'")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR_WEIGHT -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR_STRICT -ErrorAction SilentlyContinue")
+    if variant.phase_separation != "shared-signal":
+        lines.append(
+            f"$env:FFAC_PHASE_SEPARATION = '{variant.phase_separation}'"
+        )
+    else:
+        lines.append("Remove-Item Env:\\FFAC_PHASE_SEPARATION -ErrorAction SilentlyContinue")
     return lines
 
 
@@ -725,6 +832,20 @@ def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, sp
         env["FFAC_SIGNAL_PARAMETERIZATION"] = variant.signal_parameterization
     else:
         env.pop("FFAC_SIGNAL_PARAMETERIZATION", None)
+    if variant.color_path_anchor != "off":
+        env["FFAC_COLOR_PATH_ANCHOR"] = variant.color_path_anchor
+        env["FFAC_COLOR_PATH_ANCHOR_WEIGHT"] = (
+            f"{variant.color_path_anchor_weight:g}"
+        )
+        env["FFAC_COLOR_PATH_ANCHOR_STRICT"] = "on"
+    else:
+        env.pop("FFAC_COLOR_PATH_ANCHOR", None)
+        env.pop("FFAC_COLOR_PATH_ANCHOR_WEIGHT", None)
+        env.pop("FFAC_COLOR_PATH_ANCHOR_STRICT", None)
+    if variant.phase_separation != "shared-signal":
+        env["FFAC_PHASE_SEPARATION"] = variant.phase_separation
+    else:
+        env.pop("FFAC_PHASE_SEPARATION", None)
     if master:
         env["FFAC_MASTER_LIGHT_CONTEXT"] = "on"
     else:
@@ -873,7 +994,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="holiday4",
         help=(
             "Variant name, comma-list, final_production, reduced_model, "
-            "final_geometry, screen_step1, holiday4, holiday5, spatial, global, or all."
+            "final_geometry, phase_screen, screen_step1, holiday4, holiday5, "
+            "spatial, global, or all."
         ),
     )
     cmd.add_argument(
@@ -881,7 +1003,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help=(
             "production, rollout, final_production, reduced_model, final_geometry, "
-            "screen_step1, all, or an explicit space/comma-separated run list."
+            "phase_screen, screen_step1, all, or an explicit space/comma-separated run list."
         ),
     )
     cmd.add_argument("--repo", default=".")
@@ -926,7 +1048,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="hardcase8",
         help=(
             "Variant name, comma-list, final_production, reduced_model, "
-            "final_geometry, screen_step1, hardcase8, holiday4, holiday5, "
+            "final_geometry, phase_screen, screen_step1, hardcase8, holiday4, holiday5, "
             "spatial, global, or all."
         ),
     )
@@ -935,7 +1057,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="hardcases",
         help=(
             "production, rollout, hardcases, final_production, reduced_model, "
-            "final_geometry, screen_step1, all, or an explicit "
+            "final_geometry, phase_screen, screen_step1, all, or an explicit "
             "space/comma-separated run list."
         ),
     )

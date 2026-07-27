@@ -74,6 +74,7 @@ from auto_calibrate_color_to_mass import (  # noqa: E402
     save_best_calibration,
     suggest_params_trial,
     write_history_csv,
+    _normalise_phase_separation,  # type: ignore
     _normalise_signal_parameterization,  # type: ignore
     _parse_signal_name,  # type: ignore
     _value_entries_by_label,  # type: ignore
@@ -1002,6 +1003,30 @@ def _generate_warmup_params(
             mid[entry["name"]] = 0.5 * (entry["bounds"][0] + entry["bounds"][1])
     warmups.append(mid)
 
+    # The independent gas branch has two coupled threshold parameters. Seed a
+    # compact physical grid in addition to random warmups so TPE observes both
+    # near-binary and gradual gas responses before it starts proposing trials.
+    entries_by_name = {entry["name"]: entry for entry in context.param_space}
+    onset_entry = entries_by_name.get("gas.residual_onset")
+    width_entry = entries_by_name.get("gas.residual_width")
+    if onset_entry is not None and width_entry is not None:
+        onset_low, onset_high = onset_entry["bounds"]
+        width_low, width_high = width_entry["bounds"]
+        onset_levels = [
+            max(onset_low, min(onset_high, value))
+            for value in (0.02, 0.05, 0.10, 0.20, 0.40)
+        ]
+        width_levels = [
+            max(width_low, min(width_high, value))
+            for value in (0.05, 0.10, 0.20, 0.40, 0.80)
+        ]
+        for onset in onset_levels:
+            for width in width_levels:
+                profile = dict(mid)
+                profile["gas.residual_onset"] = onset
+                profile["gas.residual_width"] = width
+                warmups.append(profile)
+
     def _apply_profile_values(profile: Dict[str, Any], idx_values: Dict[int, float]) -> None:
         for entries in val_entries_by_label.values():
             for entry in entries:
@@ -1257,6 +1282,10 @@ def _task_payload(
     objective_integral: str,
     bounds_file: Optional[Path],
     signal_parameterization: Optional[str] = None,
+    phase_separation: Optional[str] = None,
+    color_path_anchor: Optional[str] = None,
+    color_path_anchor_weight: Optional[float] = None,
+    color_path_anchor_strict: Optional[bool] = None,
     trial_number: Optional[int] = None,
     attempt: int = 0,
     quality: Optional[Dict[str, Any]] = None,
@@ -1282,6 +1311,28 @@ def _task_payload(
     }
     if signal_parameterization:
         payload["signal_parameterization"] = signal_parameterization
+    payload["phase_separation"] = _normalise_phase_separation(
+        phase_separation or os.environ.get("FFAC_PHASE_SEPARATION")
+    )
+    payload["color_path_anchor"] = (
+        color_path_anchor
+        if color_path_anchor is not None
+        else os.environ.get("FFAC_COLOR_PATH_ANCHOR", "")
+    )
+    raw_anchor_weight = (
+        color_path_anchor_weight
+        if color_path_anchor_weight is not None
+        else os.environ.get("FFAC_COLOR_PATH_ANCHOR_WEIGHT", "0.75")
+    )
+    payload["color_path_anchor_weight"] = float(raw_anchor_weight)
+    payload["color_path_anchor_strict"] = (
+        bool(color_path_anchor_strict)
+        if color_path_anchor_strict is not None
+        else os.environ.get(
+            "FFAC_COLOR_PATH_ANCHOR_STRICT", ""
+        ).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     if quality:
         payload["quality"] = quality
     if sanity:
@@ -1747,6 +1798,9 @@ def master_main(args: argparse.Namespace) -> None:
     signal_parameterization = _normalise_signal_parameterization(
         os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
     )
+    phase_separation = _normalise_phase_separation(
+        os.environ.get("FFAC_PHASE_SEPARATION")
+    )
     run_states: Dict[str, RunState] = {}
     in_flight: Dict[str, TaskInfo] = {}
     stale_counts: Dict[str, int] = {}
@@ -1796,6 +1850,11 @@ def master_main(args: argparse.Namespace) -> None:
         "template_registration_mode": os.environ.get("FFAC_TEMPLATE_REGISTRATION_MODE", ""),
         "template_registration_strict": os.environ.get("FFAC_TEMPLATE_REGISTRATION_STRICT", ""),
         "signal_parameterization": signal_parameterization,
+        "phase_separation": phase_separation,
+        "color_path_anchor": os.environ.get("FFAC_COLOR_PATH_ANCHOR", ""),
+        "color_path_anchor_weight": os.environ.get(
+            "FFAC_COLOR_PATH_ANCHOR_WEIGHT", ""
+        ),
     }
 
     def _log_master(message: str) -> None:
@@ -1852,6 +1911,7 @@ def master_main(args: argparse.Namespace) -> None:
             label_weights=label_weights,
             static_light_correction=os.environ.get("FFAC_STATIC_LIGHT_CORRECTION", "off"),
             signal_parameterization=signal_parameterization,
+            phase_separation=phase_separation,
         )
         run_label_weights = label_weights
         if args.use_label_weights and args.auto_label_weights and not label_weights:
@@ -2622,6 +2682,26 @@ def worker_loop(args: argparse.Namespace) -> None:
             payload.get("signal_parameterization")
             or os.environ.get("FFAC_SIGNAL_PARAMETERIZATION")
         )
+        phase_separation = _normalise_phase_separation(
+            payload.get("phase_separation")
+            or os.environ.get("FFAC_PHASE_SEPARATION")
+        )
+        color_path_anchor = str(
+            payload.get("color_path_anchor")
+            or os.environ.get("FFAC_COLOR_PATH_ANCHOR", "")
+        )
+        try:
+            color_path_anchor_weight = float(
+                payload.get(
+                    "color_path_anchor_weight",
+                    os.environ.get("FFAC_COLOR_PATH_ANCHOR_WEIGHT", "0.75"),
+                )
+            )
+        except (TypeError, ValueError):
+            color_path_anchor_weight = 0.75
+        color_path_anchor_strict = bool(
+            payload.get("color_path_anchor_strict", False)
+        )
         quality = quality_override or payload.get("quality")
         scale = 1.0
         dtype = None
@@ -2646,6 +2726,10 @@ def worker_loop(args: argparse.Namespace) -> None:
             objective_integral,
             static_light_correction,
             signal_parameterization,
+            phase_separation,
+            color_path_anchor,
+            color_path_anchor_weight,
+            color_path_anchor_strict,
         )
         if cache_key in context_cache:
             return context_cache[cache_key]
@@ -2665,6 +2749,10 @@ def worker_loop(args: argparse.Namespace) -> None:
             objective_integral=objective_integral,
             static_light_correction=static_light_correction,
             signal_parameterization=signal_parameterization,
+            phase_separation=phase_separation,
+            color_path_anchor=color_path_anchor,
+            color_path_anchor_weight=color_path_anchor_weight,
+            color_path_anchor_strict=color_path_anchor_strict,
         )
         context_cache[cache_key] = ctx
         return ctx
@@ -3451,7 +3539,8 @@ def build_parser() -> argparse.ArgumentParser:
     master.add_argument(
         "--objective-integral",
         default="off",
-        help="Objective mode: off (point-wise), l1, l2, or drift[:LAMBDA] "
+        help="Objective mode: off (point-wise), window-balanced, or drift[:LAMBDA] "
+             "(window-balanced gives equal influence to I1, I2, 4.1-8 h, and >8 h); "
              "(point-wise + LAMBDA * total-variation of detected mass over the "
              "post-injection plateau; mass-conservation penalty, default LAMBDA=1.0).",
     )

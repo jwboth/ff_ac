@@ -61,6 +61,7 @@ _SHARED_SIGNAL_PARAM_RE = re.compile(r"^signal\.shared\.value(?P<idx>\d+)$")
 _SIGNAL_GAIN_RE = re.compile(r"^signal\.label(?P<label>-?\d+)\.gain$")
 _VALUE_RE = re.compile(r"(?:.*\.)?value(\d+)$", re.IGNORECASE)
 _SHARED_SIGNAL_LABEL = -1
+_RESIDUAL_GAS_SCORE_CLIP = 2.0
 
 
 # =========================================================================
@@ -70,6 +71,8 @@ _SHARED_SIGNAL_LABEL = -1
 class Metrics:
     injected_full: float
     total_full: float
+    gaseous_full: Optional[float] = None
+    aqueous_full: Optional[float] = None
 
 
 @dataclass
@@ -98,10 +101,13 @@ class CalibrationContext:
     per_label_params: bool = True
     signal_parameterization: str = "per-label"
     objective_integral: str = "off"
+    phase_separation: str = "shared-signal"
     label_weights: Optional[Dict[int, float]] = None
     calibration_folder: Optional[Path] = None
     # preloaded (corrected image, injected_mass) pairs - read once, reused per trial
     _loaded: List[Tuple[Any, float, float]] = field(default_factory=list)  # (img, injected, t_hours)
+    # Quantized, parameter-independent optical residual used by residual-gas.
+    _gas_scores: List[np.ndarray] = field(default_factory=list)
 
 
 # =========================================================================
@@ -135,6 +141,29 @@ def _normalise_signal_parameterization(mode: str | None) -> str:
     if value not in {"per-label", "shared-shape"}:
         raise ValueError(
             f"Unknown signal parameterization {mode!r}; expected per-label or shared-shape."
+        )
+    return value
+
+
+def _normalise_phase_separation(mode: str | None) -> str:
+    value = (
+        mode
+        or os.environ.get("FFAC_PHASE_SEPARATION")
+        or "shared-signal"
+    ).strip().lower().replace("_", "-")
+    aliases = {
+        "off": "shared-signal",
+        "none": "shared-signal",
+        "default": "shared-signal",
+        "shared": "shared-signal",
+        "residual": "residual-gas",
+        "optical-residual": "residual-gas",
+        "separate-gas": "residual-gas",
+    }
+    value = aliases.get(value, value)
+    if value not in {"shared-signal", "residual-gas"}:
+        raise ValueError(
+            f"Unknown phase separation {mode!r}; expected shared-signal or residual-gas."
         )
     return value
 
@@ -1023,6 +1052,261 @@ def _setup_template_registration(
         return None, "off"
 
 
+def _path_arc_length(relative_colors: Sequence[np.ndarray]) -> float:
+    colors = np.asarray(relative_colors, dtype=np.float64)
+    if colors.ndim != 2 or len(colors) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(colors, axis=0), axis=1)))
+
+
+def _resample_relative_path(color_path: Any, count: int) -> np.ndarray:
+    colors = np.asarray(color_path.relative_colors, dtype=np.float64)
+    source = np.asarray(color_path.relative_distances, dtype=np.float64)
+    target = np.linspace(0.0, 1.0, int(count))
+    return np.column_stack(
+        [np.interp(target, source, colors[:, channel]) for channel in range(3)]
+    )
+
+
+def _regularize_color_paths(
+    *,
+    run: str,
+    config: Any,
+    calibration: Any,
+    calibration_folder: Path,
+    labels: Sequence[int],
+    anchor_run: str | None = None,
+    anchor_weight: float | None = None,
+    anchor_strict: bool | None = None,
+) -> None:
+    """Blend noisy per-run path shapes toward a shared, independently observed path.
+
+    The current run keeps its own baseline and path amplitude. Only the normalized
+    RGB trajectory is shrunk toward the anchor, so colour correction remains
+    run-specific while implausible path tortuosity is regularized.
+    """
+
+    anchor_run = (
+        anchor_run
+        if anchor_run is not None
+        else os.environ.get("FFAC_COLOR_PATH_ANCHOR", "")
+    ).strip().lower()
+    if not anchor_run or anchor_run in {"off", "none"}:
+        return
+    weight = float(
+        anchor_weight
+        if anchor_weight is not None
+        else os.environ.get("FFAC_COLOR_PATH_ANCHOR_WEIGHT", "0.75")
+    )
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(
+            f"FFAC_COLOR_PATH_ANCHOR_WEIGHT must be within [0, 1], got {weight}"
+        )
+    if anchor_run == run.lower() or weight == 0.0:
+        logger.info(
+            "[%s] color-path anchor is the current run; no regularization needed.",
+            run,
+        )
+        return
+
+    try:
+        import darsia
+
+        results_dir = Path(getattr(getattr(config, "data", None), "results"))
+        relative_folder = calibration_folder.relative_to(results_dir)
+        anchor_folder = (
+            results_dir.parent
+            / anchor_run
+            / relative_folder
+            / "color_path_interpretation"
+        )
+        changed: list[str] = []
+        for label in labels:
+            target_interpolation = calibration.color_path_interpretation[int(label)]
+            anchor_path = (
+                anchor_folder / f"color_path_interpretation_{int(label)}"
+            )
+            anchor_interpolation = darsia.ColorPathInterpolation.load(anchor_path)
+            target_path = target_interpolation.color_path
+            count = len(target_path.relative_colors)
+            target_colors = _resample_relative_path(target_path, count)
+            anchor_colors = _resample_relative_path(
+                anchor_interpolation.color_path,
+                count,
+            )
+            target_arc = _path_arc_length(target_colors)
+            anchor_arc = _path_arc_length(anchor_colors)
+            if target_arc <= 1e-12 or anchor_arc <= 1e-12:
+                raise ValueError(
+                    f"label {label}: zero-length target/anchor color path"
+                )
+            anchor_colors *= target_arc / anchor_arc
+            blended = (1.0 - weight) * target_colors + weight * anchor_colors
+            blended[0] = 0.0
+            regularized_path = darsia.ColorPath(
+                base_color=np.asarray(target_path.base_color, dtype=np.float64),
+                relative_colors=[row for row in blended],
+                mode=target_path.mode,
+                name=f"{target_path.name}|anchor={anchor_run}|weight={weight:g}",
+            )
+            target_interpolation.color_path = regularized_path
+            # HeterogeneousModel shallow-copies interpolation objects at setup.
+            # Keep the executable copy synchronized with the public mapping.
+            calibration.color_analysis.model[0][int(label)].color_path = (
+                regularized_path
+            )
+            changed.append(
+                f"{label}:arc={target_arc:.4g},anchor_scale={target_arc / anchor_arc:.4g}"
+            )
+        logger.info(
+            "[%s] color-path regularization ACTIVE anchor=%s weight=%.3f [%s]",
+            run,
+            anchor_run,
+            weight,
+            "; ".join(changed),
+        )
+    except Exception as exc:  # noqa: BLE001
+        strict = (
+            bool(anchor_strict)
+            if anchor_strict is not None
+            else os.environ.get(
+                "FFAC_COLOR_PATH_ANCHOR_STRICT", ""
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if strict:
+            raise
+        logger.warning(
+            "[%s] color-path regularization requested but skipped: %s",
+            run,
+            exc,
+        )
+
+
+def _optical_residual_gas_score(
+    calibration: Any,
+    image: Any,
+    labels: Sequence[int],
+) -> np.ndarray:
+    """Return a quantized gas observable independent of color-path position.
+
+    Aqueous indicator changes should stay close to the calibrated RGB path.
+    Gas bubbles and gas-water interfaces add reflection/scattering and local
+    high-frequency structure, producing an off-path optical residual.
+    """
+
+    import cv2
+
+    observed = np.asarray(image.img, dtype=np.float32)[..., :3]
+    base = getattr(getattr(calibration, "color_analysis", None), "base", None)
+    if base is not None:
+        observed = observed - np.asarray(base.img, dtype=np.float32)[..., :3]
+    label_image = np.asarray(calibration.labels.img)
+    if label_image.shape != observed.shape[:2]:
+        raise ValueError(
+            "Residual-gas labels/image shape mismatch: "
+            f"{label_image.shape} != {observed.shape[:2]}"
+        )
+
+    gray = np.mean(observed, axis=2, dtype=np.float32)
+    sigma = max(
+        0.1,
+        float(os.environ.get("FFAC_RESIDUAL_GAS_TEXTURE_SIGMA", "2.0")),
+    )
+    texture_weight = max(
+        0.0,
+        float(os.environ.get("FFAC_RESIDUAL_GAS_TEXTURE_WEIGHT", "0.5")),
+    )
+    texture = np.abs(
+        gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    )
+    score = np.zeros(label_image.shape, dtype=np.float32)
+    flat_observed = observed.reshape(-1, 3)
+    flat_texture = texture.reshape(-1)
+    flat_score = score.reshape(-1)
+    chunk_size = max(
+        10_000,
+        int(os.environ.get("FFAC_RESIDUAL_GAS_CHUNK_PIXELS", "250000")),
+    )
+
+    for label in labels:
+        interpolation = calibration.color_analysis.model[0][int(label)]
+        color_path = interpolation.color_path
+        positions = np.flatnonzero(label_image.reshape(-1) == int(label))
+        if not positions.size:
+            continue
+        path_scale = max(
+            1e-6,
+            float(
+                np.sum(
+                    np.linalg.norm(
+                        np.diff(
+                            np.asarray(
+                                color_path.relative_colors,
+                                dtype=np.float32,
+                            ),
+                            axis=0,
+                        ),
+                        ord=1,
+                        axis=1,
+                    )
+                )
+            ),
+        )
+        for start in range(0, positions.size, chunk_size):
+            index = positions[start : start + chunk_size]
+            colors = flat_observed[index]
+            parameters = color_path.fit(
+                colors=colors,
+                color_mode=interpolation.color_mode,
+                mode="equidistant",
+            )
+            projected = color_path.interpret(
+                parameters,
+                color_mode=interpolation.color_mode,
+                mode="equidistant",
+            )
+            off_path = np.linalg.norm(colors - projected, ord=1, axis=1)
+            flat_score[index] = (
+                off_path + texture_weight * flat_texture[index]
+            ) / path_scale
+
+    return np.rint(
+        np.clip(score / _RESIDUAL_GAS_SCORE_CLIP, 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+
+
+def _precompute_residual_gas_scores(
+    calibration: Any,
+    loaded: Sequence[Tuple[Any, float, float]],
+    labels: Sequence[int],
+    *,
+    run: str,
+) -> List[np.ndarray]:
+    scores: list[np.ndarray] = []
+    samples: list[np.ndarray] = []
+    active = np.isin(np.asarray(calibration.labels.img), np.asarray(labels))
+    active_flat = active.reshape(-1)
+    for image, _injected, _time_h in loaded:
+        quantized = _optical_residual_gas_score(calibration, image, labels)
+        scores.append(quantized)
+        values = quantized.reshape(-1)[active_flat][::200]
+        if values.size:
+            samples.append(values)
+    if samples:
+        sampled = (
+            np.concatenate(samples).astype(np.float32)
+            * (_RESIDUAL_GAS_SCORE_CLIP / 255.0)
+        )
+        percentiles = np.percentile(sampled, [50.0, 90.0, 99.0, 99.9])
+        logger.info(
+            "[%s] residual-gas optical score ACTIVE; p50/p90/p99/p99.9=%s",
+            run,
+            np.round(percentiles, 4).tolist(),
+        )
+    return scores
+
+
 def write_history_csv(path: Path, history: Sequence[Dict[str, Any]]) -> None:  # type: ignore
     rows = list(history or [])
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -1122,10 +1406,15 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                   use_label_weights=False, label_weights=None, quality_scale=1.0,
                   quality_dtype=None, objective_integral="off",
                   static_light_correction=None, signal_parameterization=None,
+                  phase_separation=None,
+                  color_path_anchor=None,
+                  color_path_anchor_weight=None,
+                  color_path_anchor_strict=None,
                   evaluation_times_hours=None,
                   evaluation_time_tolerance_seconds=600.0) -> CalibrationContext:
     import numpy as np
     signal_parameterization = _normalise_signal_parameterization(signal_parameterization)
+    phase_separation = _normalise_phase_separation(phase_separation)
     from darsia.presets.workflows.analysis.analysis_context import (
         prepare_analysis_context,
         select_image_paths,
@@ -1245,6 +1534,16 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
         if labels_img is not None:
             all_labels = [int(x) for x in np.unique(labels_img) if x >= 0]
     signal_labels = [l for l in all_labels if l not in ignore and l != 0]
+    _regularize_color_paths(
+        run=run,
+        config=config,
+        calibration=cta,
+        calibration_folder=calibration_folder,
+        labels=signal_labels,
+        anchor_run=color_path_anchor,
+        anchor_weight=color_path_anchor_weight,
+        anchor_strict=color_path_anchor_strict,
+    )
 
     light_master = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT", "").strip().lower() in (
         "1",
@@ -1640,6 +1939,36 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
                                     per_label_params=per_label_params, use_facies=use_facies,
                                     n_free_values=n_free_values,
                                     signal_parameterization=signal_parameterization)
+    if phase_separation == "residual-gas":
+        override = (bounds_map or {}).get(run, {})
+        default_override = (bounds_map or {}).get("default", {})
+        for entry in (
+            {
+                "name": "gas.residual_onset",
+                "attr_path": ["phase_separation", "residual_onset"],
+                "bounds": (0.01, 0.80),
+                "type": "float",
+            },
+            {
+                "name": "gas.residual_width",
+                "attr_path": ["phase_separation", "residual_width"],
+                "bounds": (0.02, 1.50),
+                "type": "float",
+            },
+        ):
+            bounds = _match_bounds(entry["name"], override, default_override)
+            if bounds is not None:
+                entry["bounds"] = tuple(bounds)
+            param_space.append(entry)
+
+    gas_scores: List[np.ndarray] = []
+    if phase_separation == "residual-gas" and loaded:
+        gas_scores = _precompute_residual_gas_scores(
+            cta,
+            loaded,
+            signal_labels,
+            run=run,
+        )
 
     return CalibrationContext(
         run=run, config=config, experiment=experiment, fluidflower=fluidflower,
@@ -1649,11 +1978,63 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
         per_label_params=per_label_params,
         signal_parameterization=signal_parameterization,
         objective_integral=objective_integral,
+        phase_separation=phase_separation,
         label_weights=label_weights, calibration_folder=calibration_folder, _loaded=loaded,
+        _gas_scores=gas_scores,
     )
 
 
 _EVAL_TB_PRINTED = False
+
+
+def _mass_result_for_evaluation(
+    context: CalibrationContext,
+    image: Any,
+    image_index: int,
+    params: Dict[str, Any],
+) -> Any:
+    result = context.calibration(image)
+    mode = _normalise_phase_separation(
+        getattr(context, "phase_separation", "shared-signal")
+    )
+    if mode != "residual-gas":
+        return result
+    if image_index >= len(context._gas_scores):
+        raise IndexError(
+            f"Missing residual-gas score {image_index} for {context.run}"
+        )
+
+    score = (
+        np.asarray(context._gas_scores[image_index], dtype=np.float32)
+        * (_RESIDUAL_GAS_SCORE_CLIP / 255.0)
+    )
+    onset = float(params.get("gas.residual_onset", 0.20))
+    width = max(1e-6, float(params.get("gas.residual_width", 0.40)))
+    saturation_g = np.clip((score - onset) / width, 0.0, 1.0)
+
+    # Gas can only occur where the indicator records CO2 arrival. The soft gate
+    # avoids classifying fixed optical defects as gas while retaining interfaces.
+    concentration_aq = np.asarray(result.concentration_aq.img, dtype=np.float32)
+    arrival_scale = max(
+        1e-6,
+        float(os.environ.get("FFAC_RESIDUAL_GAS_ARRIVAL_SCALE", "0.02")),
+    )
+    saturation_g *= np.clip(concentration_aq / arrival_scale, 0.0, 1.0)
+
+    mass_analysis = context.calibration.co2_mass_analysis
+    density = np.asarray(mass_analysis.density_gaseous_co2)
+    solubility = np.asarray(mass_analysis.solubility_co2)
+    mass_g = density * saturation_g
+    mass_aq = solubility * concentration_aq * np.clip(
+        1.0 - saturation_g,
+        0.0,
+        1.0,
+    )
+    result.saturation_g.img = saturation_g
+    result.mass_g.img = mass_g
+    result.mass_aq.img = mass_aq
+    result.mass.img = mass_g + mass_aq
+    return result
 
 
 def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalResult:
@@ -1673,7 +2054,18 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
     samples: List[Tuple[float, float, float]] = []  # (t_hours, injected, detected)
     for i, (img, injected, t_h) in enumerate(context._loaded):
         try:
-            detected = float(context.geometry.integrate(context.calibration(img).mass))
+            mass_result = _mass_result_for_evaluation(context, img, i, params)
+            detected = float(context.geometry.integrate(mass_result.mass))
+            detected_g = (
+                float(context.geometry.integrate(mass_result.mass_g))
+                if getattr(mass_result, "mass_g", None) is not None
+                else None
+            )
+            detected_aq = (
+                float(context.geometry.integrate(mass_result.mass_aq))
+                if getattr(mass_result, "mass_aq", None) is not None
+                else None
+            )
         except Exception as exc:  # noqa: BLE001
             # One-shot full traceback to stdout so the EXACT file:line of a shape/broadcast
             # mismatch is visible (the status string only carries the message). Also dumps
@@ -1706,7 +2098,12 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
             feasible = False
         # key by time-since-start in hours so the calibration viewer plots a real
         # time axis (0.17h .. 48h), not image indices.
-        metrics[f"{t_h:.3f}h"] = Metrics(injected_full=injected, total_full=detected)
+        metrics[f"{t_h:.3f}h"] = Metrics(
+            injected_full=injected,
+            total_full=detected,
+            gaseous_full=detected_g,
+            aqueous_full=detected_aq,
+        )
         samples.append((float(t_h), float(injected), float(detected)))
     # --- Mass-conservation (drift) penalty, opt-in via --objective-integral drift[:LAMBDA] ---
     # Physics: after shut-in the cell is closed, so TRUE total mass is constant. But the BTB
@@ -1718,7 +2115,37 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
     # (where the fringe contributes ~0), i.e. a FLAT detected-mass curve at the right level
     # rather than a drifting curve that is merely right on average. Metrics stay raw.
     mode = str(getattr(context, "objective_integral", "off") or "off").strip().lower()
-    if mode.startswith("drift"):
+    if mode in {"window-balanced", "windows", "balanced-windows"}:
+        windows: dict[str, list[float]] = {
+            "I1": [],
+            "I2": [],
+            "early": [],
+            "late": [],
+        }
+        for time_h, injected, detected in samples:
+            if time_h <= 0.92:
+                key = "I1"
+            elif time_h < 4.0:
+                key = "I2"
+            # Requested 4.1/8 h frames can resolve a few minutes to either side.
+            # These tolerant cutoffs preserve their intended operational window.
+            elif time_h <= 8.25:
+                key = "early"
+            else:
+                key = "late"
+            windows[key].append(abs(detected - injected))
+        if any(not values for values in windows.values()):
+            return EvalResult(
+                objective=PENALTY_VALUE,
+                feasible=False,
+                metrics=metrics,
+                status="missing-objective-window",
+                params=params,
+            )
+        # Each operational window contributes one mean absolute error, regardless
+        # of how many calibration frames happen to lie inside that window.
+        total_err = sum(float(np.mean(values)) for values in windows.values())
+    elif mode.startswith("drift"):
         lam = 1.0
         if ":" in mode:
             try:
