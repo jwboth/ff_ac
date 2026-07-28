@@ -27,6 +27,7 @@ from scripts.auto_calibrate_color_to_mass import (
 )
 from scripts.distributed_auto_calibration_queue import (
     _generate_warmup_params,
+    _select_pending_task,
     _task_payload,
 )
 
@@ -106,6 +107,40 @@ def test_evaluation_backend_aliases_and_validation():
     assert _normalise_evaluation_backend("cuda") == "cuda"
     with pytest.raises(ValueError, match="Unknown evaluation backend"):
         _normalise_evaluation_backend("invalid")
+
+
+def test_cpu_task_selection_prioritizes_sanity_over_preferred_run(tmp_path):
+    dirs = {
+        "pending": tmp_path / "pending",
+        "in_progress": tmp_path / "in_progress",
+    }
+    for path in dirs.values():
+        path.mkdir()
+    (dirs["pending"] / "ac20_warmup.json").write_text(
+        '{"run":"ac20","phase":"warmup","seq":10}',
+        encoding="utf-8",
+    )
+    sanity = dirs["pending"] / "ac27_sanity.json"
+    sanity.write_text(
+        '{"run":"ac27","phase":"sanity","seq":2}',
+        encoding="utf-8",
+    )
+
+    selected = _select_pending_task(
+        dirs,
+        "Olav_3",
+        preferred_run="ac20",
+        allow_sanity=True,
+    )
+    selected_without_sanity = _select_pending_task(
+        dirs,
+        "Moderskipet_0",
+        preferred_run="ac20",
+        allow_sanity=False,
+    )
+
+    assert selected == sanity
+    assert selected_without_sanity == dirs["pending"] / "ac20_warmup.json"
 
 
 def _cuda_available() -> bool:

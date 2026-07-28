@@ -455,6 +455,18 @@ def _select_pending_task(
     if not run_to_candidates:
         return None
 
+    if allow_sanity:
+        sanity_candidates = [
+            (seq, path)
+            for items in run_to_candidates.values()
+            for seq, path, phase in items
+            if phase == "sanity"
+        ]
+        if sanity_candidates:
+            sanity_candidates.sort(key=lambda item: (item[0], item[1].name))
+            idx = abs(hash(worker_id)) % len(sanity_candidates)
+            return sanity_candidates[idx][1]
+
     in_progress_counts: Dict[str, int] = {run: 0 for run in run_to_candidates}
     for path in dirs["in_progress"].glob("*.json"):
         payload = _load_json_retry(path)
