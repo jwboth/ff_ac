@@ -3060,6 +3060,12 @@ def worker_loop(args: argparse.Namespace) -> None:
                     os.replace(claimed, pending_path)
                 except OSError:
                     pass
+            if sanity_lock_acquired:
+                _release_sanity_lock(
+                    args.control_dir,
+                    worker_hostname,
+                    worker_id,
+                )
             _write_worker_state(log_dir, worker_id, {"last_run": None})
             _shutdown_worker("run-switch")
             return
