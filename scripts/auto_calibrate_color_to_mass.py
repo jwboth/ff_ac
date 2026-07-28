@@ -118,6 +118,7 @@ class CalibrationContext:
     _prepared_colors: List[Any] = field(default_factory=list)
     _evaluation_backend: str = "legacy"
     _cuda_evaluator: Any = None
+    _opencl_evaluator: Any = None
 
 
 # =========================================================================
@@ -2003,11 +2004,13 @@ def _normalise_evaluation_backend(mode: str | None) -> str:
         "fast": "prepared",
         "numpy": "prepared",
         "off": "legacy",
+        "ocl": "opencl",
     }
     value = aliases.get(value, value)
-    if value not in {"legacy", "prepared", "cuda"}:
+    if value not in {"legacy", "prepared", "cuda", "opencl"}:
         raise ValueError(
-            f"Unknown evaluation backend {mode!r}; expected legacy, prepared, or cuda."
+            f"Unknown evaluation backend {mode!r}; expected legacy, prepared, "
+            "cuda, or opencl."
         )
     return value
 
@@ -2317,6 +2320,19 @@ def prepare_evaluation_context(
             raise
         context._prepared_colors.clear()
         gc.collect()
+    if requested == "opencl" and context._opencl_evaluator is None:
+        from opencl_integrated_evaluator import OpenCLIntegratedEvaluator
+
+        try:
+            context._opencl_evaluator = OpenCLIntegratedEvaluator(
+                context,
+                residual_score_clip=_RESIDUAL_GAS_SCORE_CLIP,
+            )
+        except Exception:
+            gc.collect()
+            raise
+        context._prepared_colors.clear()
+        gc.collect()
     context._evaluation_backend = requested
     return context
 
@@ -2391,23 +2407,26 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
     feasible = True
     metrics: Dict[str, Metrics] = {}
     samples: List[Tuple[float, float, float]] = []  # (t_hours, injected, detected)
-    cuda_masses: Optional[List[Tuple[float, float, float]]] = None
-    cuda_evaluator = getattr(context, "_cuda_evaluator", None)
-    if cuda_evaluator is not None:
+    integrated_masses: Optional[List[Tuple[float, float, float]]] = None
+    integrated_evaluator = getattr(context, "_cuda_evaluator", None)
+    if integrated_evaluator is None:
+        integrated_evaluator = getattr(context, "_opencl_evaluator", None)
+    if integrated_evaluator is not None:
         try:
-            cuda_masses = cuda_evaluator.evaluate(params)
+            integrated_masses = integrated_evaluator.evaluate(params)
         except Exception as exc:  # noqa: BLE001
+            backend = getattr(context, "_evaluation_backend", "integrated")
             return EvalResult(
                 objective=PENALTY_VALUE,
                 feasible=False,
                 metrics={},
-                status=f"cuda-eval-error:{exc}",
+                status=f"eval-error:{backend}:{exc}",
                 params=params,
             )
     for i, (img, injected, t_h) in enumerate(context._loaded):
         try:
-            if cuda_masses is not None:
-                detected, detected_g, detected_aq = cuda_masses[i]
+            if integrated_masses is not None:
+                detected, detected_g, detected_aq = integrated_masses[i]
             else:
                 mass_result = _mass_result_for_evaluation(context, img, i, params)
                 detected = float(context.geometry.integrate(mass_result.mass))

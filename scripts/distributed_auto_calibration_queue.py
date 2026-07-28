@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import copy
 import gc
 import hashlib
@@ -90,12 +91,23 @@ except Exception:  # pragma: no cover
     load_best_params_from_csv = None  # type: ignore
 
 
-QUEUE_SUBDIRS = ["pending", "in_progress", "results", "done", "failed", "heartbeats", "worker_logs"]
+QUEUE_SUBDIRS = [
+    "pending",
+    "in_progress",
+    "results",
+    "done",
+    "failed",
+    "heartbeats",
+    "worker_logs",
+    "run_leases",
+    "run_complete",
+]
 MASTER_COMPLETE_FILENAME = "master_complete.json"
 PENDING_PICK_WINDOW = 32
 MAX_CLAIM_ATTEMPTS = 5
 CLAIM_JITTER_MAX_SECONDS = 0.5
 READ_JITTER_MAX_SECONDS = 0.2
+RUN_LEASE_SCHEMA = 1
 
 
 def _now() -> float:
@@ -181,6 +193,7 @@ def _collect_worker_provenance(hostname: Optional[str] = None) -> Dict[str, Any]
         Path(__file__),
         SCRIPT_DIR / "auto_calibrate_color_to_mass.py",
         SCRIPT_DIR / "ffac_titration_flash.py",
+        SCRIPT_DIR / "opencl_integrated_evaluator.py",
     ]
     try:
         for module_name in (
@@ -196,7 +209,7 @@ def _collect_worker_provenance(hostname: Optional[str] = None) -> Dict[str, Any]
         pass
     source_fingerprint, source_files = _source_file_fingerprint(source_paths)
     packages: Dict[str, Optional[str]] = {}
-    for package in ("numpy", "scipy", "optuna", "cupy-cuda13x"):
+    for package in ("numpy", "scipy", "optuna", "cupy-cuda13x", "pyopencl"):
         try:
             packages[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -580,17 +593,21 @@ def _select_pending_task(
     worker_id: str,
     preferred_run: Optional[str] = None,
     allow_sanity: bool = True,
+    blocked_runs: Optional[Iterable[str]] = None,
 ) -> Optional[Path]:
     pending = list(dirs["pending"].glob("*.json"))
     if not pending:
         return None
 
+    blocked = set(blocked_runs or ())
     run_to_candidates: Dict[str, List[Tuple[int, Path, str]]] = {}
     for path in pending:
         info = _pending_task_info(path)
         if not info:
             continue
         run, seq, phase = info
+        if run in blocked:
+            continue
         if not allow_sanity and phase == "sanity":
             continue
         run_to_candidates.setdefault(run, []).append((seq, path, phase))
@@ -968,6 +985,217 @@ def _release_sanity_lock(control_dir: Optional[str], host: str, worker_id: str) 
         path.unlink()
     except OSError:
         pass
+
+
+def _run_lease_path(dirs: Mapping[str, Path], run: str) -> Path:
+    return dirs["run_leases"] / f"{run}.json"
+
+
+def _run_complete_path(dirs: Mapping[str, Path], run: str) -> Path:
+    return dirs["run_complete"] / f"{run}.json"
+
+
+def _run_is_complete(dirs: Mapping[str, Path], run: Optional[str]) -> bool:
+    return bool(run) and _safe_exists(_run_complete_path(dirs, str(run)))
+
+
+def _mark_run_complete(
+    dirs: Mapping[str, Path],
+    run: str,
+    *,
+    owner: str,
+) -> None:
+    _atomic_write_json(
+        _run_complete_path(dirs, run),
+        {
+            "schema": RUN_LEASE_SCHEMA,
+            "run": run,
+            "owner": owner,
+            "completed_at": _now(),
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _lease_heartbeat_is_live(
+    dirs: Mapping[str, Path],
+    worker_id: str,
+    stale_seconds: float,
+) -> bool:
+    heartbeat = dirs["heartbeats"] / f"{worker_id}.json"
+    if not _safe_exists(heartbeat):
+        return False
+    payload = _load_json_retry(heartbeat)
+    if not isinstance(payload, dict):
+        return False
+    try:
+        last_seen = float(payload.get("last_seen", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return (_now() - last_seen) <= stale_seconds
+
+
+def _lease_process_is_dead_on_this_host(payload: Mapping[str, Any]) -> bool:
+    if str(payload.get("hostname") or "").lower() != _hostname().lower():
+        return False
+    try:
+        pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            return not psutil.pid_exists(pid)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
+
+
+def _acquire_run_lease(
+    dirs: Mapping[str, Path],
+    run: str,
+    worker_id: str,
+    hostname: str,
+    backend: str,
+    *,
+    stale_seconds: float,
+) -> bool:
+    """Atomically reserve one run for one persistent evaluator."""
+
+    if _run_is_complete(dirs, run):
+        return False
+    path = _run_lease_path(dirs, run)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": RUN_LEASE_SCHEMA,
+        "run": run,
+        "worker_id": worker_id,
+        "hostname": hostname,
+        "backend": backend,
+        "pid": os.getpid(),
+        "acquired_at": _now(),
+        "updated_at": _now(),
+    }
+    for _attempt in range(3):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            current = _load_json_retry(path)
+            if isinstance(current, dict) and current.get("worker_id") == worker_id:
+                current["updated_at"] = _now()
+                current["pid"] = os.getpid()
+                _safe_write_json(path, current)
+                return True
+            if isinstance(current, dict) and _lease_process_is_dead_on_this_host(
+                current
+            ):
+                _safe_unlink(path)
+                continue
+            timestamp = None
+            if isinstance(current, dict):
+                timestamp = current.get("updated_at") or current.get("acquired_at")
+                current_worker = str(current.get("worker_id") or "")
+                if current_worker and _lease_heartbeat_is_live(
+                    dirs,
+                    current_worker,
+                    stale_seconds,
+                ):
+                    return False
+            if not isinstance(timestamp, (int, float)):
+                try:
+                    timestamp = path.stat().st_mtime
+                except OSError:
+                    timestamp = _now()
+            if (_now() - float(timestamp)) <= stale_seconds:
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            _safe_unlink(path)
+            return False
+        current = _load_json_retry(path)
+        return isinstance(current, dict) and current.get("worker_id") == worker_id
+    return False
+
+
+def _refresh_run_lease(
+    dirs: Mapping[str, Path],
+    run: Optional[str],
+    worker_id: str,
+) -> bool:
+    if not run:
+        return False
+    path = _run_lease_path(dirs, run)
+    current = _load_json_retry(path) if _safe_exists(path) else None
+    if not isinstance(current, dict) or current.get("worker_id") != worker_id:
+        return False
+    current["updated_at"] = _now()
+    current["pid"] = os.getpid()
+    return _safe_write_json(path, current)
+
+
+def _release_run_lease(
+    dirs: Mapping[str, Path],
+    run: Optional[str],
+    worker_id: str,
+) -> None:
+    if not run:
+        return
+    path = _run_lease_path(dirs, run)
+    if not _safe_exists(path):
+        return
+    current = _load_json_retry(path)
+    if isinstance(current, dict) and current.get("worker_id") not in (None, worker_id):
+        return
+    _safe_unlink(path)
+
+
+def _runs_leased_by_others(
+    dirs: Mapping[str, Path],
+    worker_id: str,
+    *,
+    stale_seconds: float,
+) -> set[str]:
+    blocked: set[str] = set()
+    for path in dirs["run_leases"].glob("*.json"):
+        payload = _load_json_retry(path)
+        if not isinstance(payload, dict):
+            continue
+        run = str(payload.get("run") or path.stem)
+        owner = str(payload.get("worker_id") or "")
+        if owner == worker_id:
+            continue
+        timestamp = payload.get("updated_at") or payload.get("acquired_at")
+        if not isinstance(timestamp, (int, float)):
+            try:
+                timestamp = path.stat().st_mtime
+            except OSError:
+                timestamp = _now()
+        live = bool(owner) and _lease_heartbeat_is_live(
+            dirs,
+            owner,
+            stale_seconds,
+        )
+        if live or (_now() - float(timestamp)) <= stale_seconds:
+            blocked.add(run)
+            continue
+        _safe_unlink(path)
+    return blocked
 
 
 def _worker_state_path(log_dir: Path, worker_id: str) -> Path:
@@ -1376,6 +1604,8 @@ class TaskInfo:
     trial: Optional[optuna.trial.Trial] = None
     attempt: int = 0
     sent_at: float = field(default_factory=_now)
+    study_ask_seconds: float = 0.0
+    suggest_seconds: float = 0.0
 
 
 @dataclass
@@ -1383,7 +1613,7 @@ class RunState:
     run: str
     context: Any
     label_weights: Dict[int, float]
-    study: optuna.Study
+    study: Optional[optuna.Study]
     warmup_params: List[Dict[str, Any]]
     max_iters: int
     distributions: Dict[str, optuna.distributions.BaseDistribution]
@@ -1407,13 +1637,53 @@ class RunState:
     baseline_eval: Optional[Any] = None
     next_iter: int = 0
     phase: str = "warmup"
+    local_ask_timings: List[float] = field(default_factory=list)
+    local_study_ask_timings: List[float] = field(default_factory=list)
+    local_suggest_timings: List[float] = field(default_factory=list)
+    local_evaluate_timings: List[float] = field(default_factory=list)
+    local_tell_timings: List[float] = field(default_factory=list)
+    local_gpu_idle_timings: List[float] = field(default_factory=list)
 
 
 def _release_run_context(state: RunState) -> None:
     if state.context is None:
         return
+    for attribute in ("_cuda_evaluator", "_opencl_evaluator"):
+        evaluator = getattr(state.context, attribute, None)
+        if evaluator is None:
+            continue
+        try:
+            evaluator.close()
+        except Exception:
+            pass
+        try:
+            setattr(state.context, attribute, None)
+        except Exception:
+            pass
     state.context = None
     state.warmup_params = []
+    gc.collect()
+
+
+def _release_completed_run_state(state: RunState) -> None:
+    """Release optimizer and image state after final output has been written."""
+
+    _release_run_context(state)
+    study = state.study
+    if study is not None:
+        try:
+            study._storage.remove_session()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    state.study = None
+    state.history.clear()
+    state.distributions.clear()
+    state.local_ask_timings.clear()
+    state.local_study_ask_timings.clear()
+    state.local_suggest_timings.clear()
+    state.local_evaluate_timings.clear()
+    state.local_tell_timings.clear()
+    state.local_gpu_idle_timings.clear()
     gc.collect()
 
 
@@ -1944,6 +2214,31 @@ def master_main(args: argparse.Namespace) -> None:
     from darsia.presets.workflows.rig import Rig
 
     runs = args.runs
+    local_eval_backend = str(
+        getattr(args, "local_eval_backend", "off") or "off"
+    ).lower()
+    local_eval_enabled = local_eval_backend != "off"
+    requested_local_run = getattr(args, "local_run", None)
+    if requested_local_run and requested_local_run not in runs:
+        raise ValueError(f"--local-run {requested_local_run!r} is not present in --runs")
+    local_run: Optional[str] = (
+        str(requested_local_run)
+        if local_eval_enabled and requested_local_run
+        else (runs[0] if local_eval_enabled and runs else None)
+    )
+    local_owner = f"local_master_{_hostname()}_{os.getpid()}"
+    local_provenance = (
+        _collect_worker_provenance(_hostname()) if local_eval_enabled else None
+    )
+    local_state_dir = (
+        Path(args.optuna_storage_dir)
+        if local_eval_enabled and args.optuna_storage_dir
+        else logs_dir
+    )
+    if local_eval_enabled:
+        local_state_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_mirror_warnings: set[str] = set()
+    last_local_evaluation_finished_at: Optional[float] = None
     param_ranges = _parse_param_ranges(args.param_ranges)
     warmup_levels_default, warmup_levels_by_idx = _parse_param_levels(args.param_levels)
     bounds_map = _apply_param_ranges(bounds_map, runs, param_ranges)
@@ -1957,6 +2252,12 @@ def master_main(args: argparse.Namespace) -> None:
     phase_separation = _normalise_phase_separation(
         os.environ.get("FFAC_PHASE_SEPARATION")
     )
+    try:
+        color_path_anchor_weight = float(
+            os.environ.get("FFAC_COLOR_PATH_ANCHOR_WEIGHT", "0.75")
+        )
+    except (TypeError, ValueError):
+        color_path_anchor_weight = 0.75
     run_states: Dict[str, RunState] = {}
     in_flight: Dict[str, TaskInfo] = {}
     stale_counts: Dict[str, int] = {}
@@ -1984,6 +2285,10 @@ def master_main(args: argparse.Namespace) -> None:
         "skip_warmup": args.skip_warmup,
         "max_iters": args.max_iters,
         "optuna_seed": getattr(args, "optuna_seed", None),
+        "optuna_persist": bool(getattr(args, "optuna_persist", False)),
+        "local_state_dir": str(local_state_dir) if local_eval_enabled else None,
+        "local_eval_backend": local_eval_backend,
+        "local_run": requested_local_run,
         "run_mode": args.run_mode,
         "max_in_flight": args.max_in_flight,
         "max_in_flight_per_run": args.max_in_flight_per_run,
@@ -2052,23 +2357,55 @@ def master_main(args: argparse.Namespace) -> None:
         except Exception:
             return
 
+    def _build_full_context(run: str) -> Any:
+        previous_light_context = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT")
+        if local_eval_enabled:
+            os.environ.pop("FFAC_MASTER_LIGHT_CONTEXT", None)
+        try:
+            return build_context(
+                run=run,
+                config_dir=Path(args.config_dir),
+                rig_cls=Rig,
+                ref_config_path=Path(args.ref_config) if args.ref_config else None,
+                use_facies=args.use_facies,
+                bounds_map=bounds_map,
+                enforce_lower=args.enforce_lower,
+                per_label_params=args.per_label,
+                use_label_weights=args.use_label_weights,
+                label_weights=label_weights,
+                quality_scale=args.quality_scale,
+                quality_dtype=args.quality_dtype,
+                objective_integral=args.objective_integral,
+                static_light_correction=os.environ.get(
+                    "FFAC_STATIC_LIGHT_CORRECTION",
+                    "off",
+                ),
+                signal_parameterization=signal_parameterization,
+                phase_separation=phase_separation,
+                color_path_anchor=os.environ.get("FFAC_COLOR_PATH_ANCHOR", ""),
+                color_path_anchor_weight=color_path_anchor_weight,
+                color_path_anchor_strict=os.environ.get(
+                    "FFAC_COLOR_PATH_ANCHOR_STRICT", ""
+                ).strip().lower()
+                in {"1", "true", "yes", "on"},
+            )
+        finally:
+            if local_eval_enabled and previous_light_context is not None:
+                os.environ["FFAC_MASTER_LIGHT_CONTEXT"] = previous_light_context
+
     def _init_run_state(run: str) -> RunState:
         run_seed = _derived_run_seed(getattr(args, "optuna_seed", None), run)
-        ctx = build_context(
-            run=run,
-            config_dir=Path(args.config_dir),
-            rig_cls=Rig,
-            ref_config_path=Path(args.ref_config) if args.ref_config else None,
-            use_facies=args.use_facies,
-            bounds_map=bounds_map,
-            enforce_lower=args.enforce_lower,
-            per_label_params=args.per_label,
-            use_label_weights=args.use_label_weights,
-            label_weights=label_weights,
-            static_light_correction=os.environ.get("FFAC_STATIC_LIGHT_CORRECTION", "off"),
-            signal_parameterization=signal_parameterization,
-            phase_separation=phase_separation,
-        )
+        is_local_run = local_eval_enabled and run == local_run
+        if is_local_run and not _acquire_run_lease(
+            dirs,
+            run,
+            local_owner,
+            _hostname(),
+            local_eval_backend,
+            stale_seconds=max(float(args.heartbeat_timeout_seconds), 600.0),
+        ):
+            raise RuntimeError(f"[{run}] could not acquire local run lease")
+        ctx = _build_full_context(run)
         run_label_weights = label_weights
         if args.use_label_weights and args.auto_label_weights and not label_weights:
             auto_weights = compute_auto_label_weights(ctx)
@@ -2091,6 +2428,41 @@ def master_main(args: argparse.Namespace) -> None:
         sanity_tmp_path = logs_dir / f"tmp_auto_calibration_sanity_{run}.csv"
         history_source = (
             history_path if history_path.exists() else (tmp_history_path if tmp_history_path.exists() else None)
+        )
+        done_warmup = sum(1 for _ in dirs["done"].glob(f"{run}_warmup_*.json"))
+        done_optuna = sum(1 for _ in dirs["done"].glob(f"{run}_optuna_*.json"))
+        done_init = sum(1 for _ in dirs["done"].glob(f"{run}_init_*.json"))
+        checkpoint_paths = [
+            local_state_dir / f"local_runner_{run}.checkpoint.json",
+            logs_dir / f"local_runner_{run}.checkpoint.json",
+        ]
+        loaded_checkpoints: List[dict] = []
+        for checkpoint_path in dict.fromkeys(checkpoint_paths):
+            if checkpoint_path.exists():
+                loaded = _load_json_retry(checkpoint_path)
+                if isinstance(loaded, dict):
+                    loaded_checkpoints.append(loaded)
+        checkpoint = max(
+            loaded_checkpoints,
+            key=lambda item: float(item.get("updated_at", 0.0) or 0.0),
+            default=None,
+        )
+        if isinstance(checkpoint, dict):
+            done_warmup = max(
+                done_warmup,
+                int(checkpoint.get("warmup_done", 0) or 0),
+            )
+            done_optuna = max(
+                done_optuna,
+                int(checkpoint.get("optuna_done", 0) or 0),
+            )
+            done_init = max(
+                done_init,
+                int(bool(checkpoint.get("init_done", False))),
+            )
+        resume_existing = bool(
+            history_source is not None
+            and (done_warmup or done_optuna or done_init)
         )
 
         fixed_params = _fixed_params_for_run(
@@ -2148,7 +2520,9 @@ def master_main(args: argparse.Namespace) -> None:
         study_kwargs: Dict[str, Any] = {}
         if sampler is not None:
             study_kwargs["sampler"] = sampler
-        if getattr(args, "optuna_persist", False):
+        persist_optuna = bool(getattr(args, "optuna_persist", False))
+        load_history_into_study = bool(args.use_history or resume_existing)
+        if persist_optuna:
             storage_dir = Path(args.optuna_storage_dir) if args.optuna_storage_dir else logs_dir
             storage_dir.mkdir(parents=True, exist_ok=True)
             storage_path = storage_dir / f"optuna_{run}.db"
@@ -2160,21 +2534,62 @@ def master_main(args: argparse.Namespace) -> None:
                 load_if_exists=True,
                 **study_kwargs,
             )
-            if args.use_history and history_source is not None:
+            if load_history_into_study and history_source is not None:
                 if study.trials:
                     _log_master(
                         f"[{run}] optuna persisted study has {len(study.trials)} trials; skip CSV history load"
                     )
                 else:
-                    for trial in _load_history_trials(history_source, distributions):
+                    restored_trials = _load_history_trials(
+                        history_source,
+                        distributions,
+                    )
+                    for trial in restored_trials:
                         study.add_trial(trial)
+                    _log_master(
+                        f"[{run}] restored {len(restored_trials)} historical "
+                        f"trial(s) into {storage_path.name}"
+                    )
         else:
             study = optuna.create_study(direction="minimize", **study_kwargs)
-            if args.use_history and history_source is not None:
+            if load_history_into_study and history_source is not None:
                 for trial in _load_history_trials(history_source, distributions):
                     study.add_trial(trial)
+            if is_local_run:
+                _log_master(
+                    f"[{run}] Optuna in-memory storage active; recovery checkpoint "
+                    f"directory={local_state_dir}"
+                )
+        if is_local_run:
+            completed_study_trials = sum(
+                1
+                for trial in study.trials
+                if trial.state == optuna.trial.TrialState.COMPLETE
+            )
+            inferred_optuna_done = max(
+                0,
+                completed_study_trials - done_warmup - done_init,
+            )
+            if inferred_optuna_done > done_optuna:
+                _log_master(
+                    f"[{run}] recovered {inferred_optuna_done - done_optuna} "
+                    "completed Optuna trial(s) from persistent study"
+                )
+                done_optuna = inferred_optuna_done
         state_context = ctx
-        if args.no_save_calibration:
+        if is_local_run:
+            prepare_started = time.perf_counter()
+            prepare_evaluation_context(
+                ctx,
+                backend=local_eval_backend,
+                release_images=True,
+            )
+            _refresh_run_lease(dirs, run, local_owner)
+            _log_master(
+                f"[{run}] local {local_eval_backend} context ready in "
+                f"{time.perf_counter() - prepare_started:.2f}s"
+            )
+        elif args.no_save_calibration:
             from types import SimpleNamespace
 
             state_context = SimpleNamespace(
@@ -2221,9 +2636,6 @@ def master_main(args: argparse.Namespace) -> None:
                         state.best_seq = None
                 except Exception:
                     pass
-        done_warmup = sum(1 for _ in dirs["done"].glob(f"{run}_warmup_*.json"))
-        done_optuna = sum(1 for _ in dirs["done"].glob(f"{run}_optuna_*.json"))
-        done_init = sum(1 for _ in dirs["done"].glob(f"{run}_init_*.json"))
         if done_warmup or done_optuna or done_init:
             state.warmup_done = done_warmup
             state.warmup_cursor = min(done_warmup, len(state.warmup_params))
@@ -2261,7 +2673,13 @@ def master_main(args: argparse.Namespace) -> None:
         worker_id = parts[1] if len(parts) > 1 else None
         return path, worker_id
 
-    def _record_result(state: RunState, info: TaskInfo, payload: dict) -> None:
+    def _record_result(
+        state: RunState,
+        info: TaskInfo,
+        payload: dict,
+        *,
+        schedule_sanity: bool = True,
+    ) -> float:
         row_settings = dict(master_settings)
         if state.label_weights:
             row_settings["label_weights"] = state.label_weights
@@ -2295,18 +2713,29 @@ def master_main(args: argparse.Namespace) -> None:
                 temp_path, row, state.sanity_header_written
             )
             state.sanity_pending = False
-            return
+            return 0.0
 
         state.history.append(row)
         temp_path = logs_dir / f"tmp_auto_calibration_{state.run}.csv"
         state.header_written = _append_temp_csv(temp_path, row, state.header_written)
 
         # Update Optuna
+        tell_seconds = 0.0
         if info.phase == "optuna":
             if info.trial is not None:
+                if state.study is None:
+                    raise RuntimeError(
+                        f"[{state.run}] Optuna study was released before tell"
+                    )
+                tell_started = time.perf_counter()
                 state.study.tell(info.trial, row["objective"])
+                tell_seconds = time.perf_counter() - tell_started
             state.optuna_done += 1
         else:
+            if state.study is None:
+                raise RuntimeError(
+                    f"[{state.run}] Optuna study was released before warmup restore"
+                )
             trial = optuna.trial.create_trial(
                 params=info.params,
                 distributions=state.distributions,
@@ -2337,7 +2766,11 @@ def master_main(args: argparse.Namespace) -> None:
                 state.best_feasible = type("Eval", (), {"objective": obj, "feasible": True})
                 state.best_feasible_params = row["params"]
 
-        sanity_every = int(getattr(args, "sanity_every", 0) or 0)
+        sanity_every = (
+            int(getattr(args, "sanity_every", 0) or 0)
+            if schedule_sanity
+            else 0
+        )
         status = str(row.get("status", ""))
         if sanity_every > 0 and not status.startswith("eval-error"):
             completed = state.warmup_done + state.optuna_done + (1 if state.init_done else 0)
@@ -2383,6 +2816,7 @@ def master_main(args: argparse.Namespace) -> None:
                 _atomic_write_json(dirs["pending"] / f"{sanity_task_id}.json", sanity_payload)
                 state.last_sanity_completed = completed
                 state.sanity_pending = True
+        return tell_seconds
 
     def _append_orphan_sanity(payload: dict) -> None:
         run = payload.get("run")
@@ -2458,6 +2892,395 @@ def master_main(args: argparse.Namespace) -> None:
             trial=info.trial,
             attempt=attempt,
         )
+
+    def _ensure_local_context(state: RunState) -> None:
+        context = state.context
+        has_full_context = bool(
+            context is not None
+            and getattr(context, "calibration", None) is not None
+            and getattr(context, "_loaded", None)
+        )
+        if has_full_context and getattr(
+            context,
+            "_evaluation_backend",
+            "legacy",
+        ) == local_eval_backend:
+            return
+        if not _acquire_run_lease(
+            dirs,
+            state.run,
+            local_owner,
+            _hostname(),
+            local_eval_backend,
+            stale_seconds=max(float(args.heartbeat_timeout_seconds), 600.0),
+        ):
+            raise RuntimeError(f"[{state.run}] could not acquire local run lease")
+        started = time.perf_counter()
+        context = _build_full_context(state.run)
+        if state.label_weights:
+            context.label_weights = state.label_weights
+        prepare_evaluation_context(
+            context,
+            backend=local_eval_backend,
+            release_images=True,
+        )
+        state.context = context
+        _refresh_run_lease(dirs, state.run, local_owner)
+        _log_master(
+            f"[{state.run}] promoted to persistent local {local_eval_backend} "
+            f"context in {time.perf_counter() - started:.2f}s"
+        )
+
+    def _next_local_task(
+        state: RunState,
+    ) -> Tuple[Optional[TaskInfo], float]:
+        init_ready = (state.init_params is None) or state.init_done
+        if (
+            state.phase == "warmup"
+            and init_ready
+            and state.warmup_done >= len(state.warmup_params)
+        ):
+            state.phase = "optuna"
+        if state.phase == "warmup":
+            if state.init_params is not None and not state.init_done:
+                state.init_dispatched = True
+                seq = state.next_iter
+                state.next_iter += 1
+                task_id = _make_task_id(state.run, "init", seq)
+                return (
+                    TaskInfo(
+                        task_id,
+                        state.run,
+                        "init",
+                        seq,
+                        state.init_params,
+                        attempt=0,
+                    ),
+                    0.0,
+                )
+            if state.warmup_cursor < len(state.warmup_params):
+                params = state.warmup_params[state.warmup_cursor]
+                state.warmup_cursor += 1
+                seq = state.next_iter
+                state.next_iter += 1
+                task_id = _make_task_id(state.run, "warmup", seq)
+                return (
+                    TaskInfo(
+                        task_id,
+                        state.run,
+                        "warmup",
+                        seq,
+                        params,
+                        attempt=0,
+                    ),
+                    0.0,
+                )
+            state.phase = "optuna"
+        if state.phase != "optuna" or state.optuna_done >= state.max_iters:
+            return None, 0.0
+        if state.study is None:
+            raise RuntimeError(f"[{state.run}] Optuna study was released before completion")
+        ask_started = time.perf_counter()
+        trial = state.study.ask()
+        study_ask_seconds = time.perf_counter() - ask_started
+        suggest_started = time.perf_counter()
+        params = suggest_params_trial(trial, state.context.param_space)
+        suggest_seconds = time.perf_counter() - suggest_started
+        ask_seconds = time.perf_counter() - ask_started
+        seq = state.next_iter
+        state.next_iter += 1
+        task_id = _make_task_id(state.run, "optuna", seq)
+        info = TaskInfo(
+            task_id,
+            state.run,
+            "optuna",
+            seq,
+            params,
+            trial,
+            attempt=0,
+            study_ask_seconds=study_ask_seconds,
+            suggest_seconds=suggest_seconds,
+        )
+        return info, ask_seconds
+
+    def _write_local_checkpoint(
+        state: RunState,
+        info: TaskInfo,
+        *,
+        ask_seconds: float,
+        evaluate_seconds: float,
+        tell_seconds: float,
+        gpu_idle_seconds: Optional[float],
+    ) -> None:
+        payload = {
+            "schema": 1,
+            "run": state.run,
+            "phase": state.phase,
+            "last_task_id": info.task_id,
+            "last_seq": info.seq,
+            "warmup_done": state.warmup_done,
+            "optuna_done": state.optuna_done,
+            "init_done": state.init_done,
+            "next_iter": state.next_iter,
+            "max_iters": state.max_iters,
+            "best_objective": (
+                float(state.best_eval.objective)
+                if state.best_eval is not None
+                else None
+            ),
+            "best_seq": state.best_seq,
+            "backend": local_eval_backend,
+            "owner": local_owner,
+            "updated_at": _now(),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "timing_seconds": {
+                "ask": ask_seconds,
+                "study_ask": info.study_ask_seconds,
+                "suggest": info.suggest_seconds,
+                "evaluate": evaluate_seconds,
+                "tell": tell_seconds,
+                "gpu_idle": gpu_idle_seconds,
+            },
+            "provenance": local_provenance,
+        }
+        checkpoint_name = f"local_runner_{state.run}.checkpoint.json"
+        primary_path = local_state_dir / checkpoint_name
+        if not _safe_write_json(primary_path, payload, attempts=8, delay=0.05):
+            raise OSError(f"Could not write local runner checkpoint: {primary_path}")
+        mirror_path = logs_dir / checkpoint_name
+        if mirror_path != primary_path and not _safe_write_json(
+            mirror_path,
+            payload,
+            attempts=5,
+            delay=0.05,
+        ):
+            if state.run not in checkpoint_mirror_warnings:
+                checkpoint_mirror_warnings.add(state.run)
+                _log_master(
+                    f"[{state.run}] WARNING: shared checkpoint mirror unavailable "
+                    f"at {mirror_path}; local checkpoint remains current"
+                )
+
+    def _record_local_timing_summary(
+        state: RunState,
+        info: TaskInfo,
+        *,
+        ask_seconds: float,
+        evaluate_seconds: float,
+        tell_seconds: float,
+        gpu_idle_seconds: Optional[float],
+    ) -> None:
+        if info.phase != "optuna":
+            return
+        series = (
+            (state.local_ask_timings, ask_seconds),
+            (state.local_study_ask_timings, info.study_ask_seconds),
+            (state.local_suggest_timings, info.suggest_seconds),
+            (state.local_evaluate_timings, evaluate_seconds),
+            (state.local_tell_timings, tell_seconds),
+        )
+        for values, value in series:
+            values.append(float(value))
+            if len(values) > 50:
+                del values[:-50]
+        if gpu_idle_seconds is not None:
+            state.local_gpu_idle_timings.append(float(gpu_idle_seconds))
+            if len(state.local_gpu_idle_timings) > 50:
+                del state.local_gpu_idle_timings[:-50]
+        if state.optuna_done % 25:
+            return
+
+        def _summary(values: Sequence[float]) -> Tuple[float, float]:
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            if len(ordered) % 2:
+                median = ordered[middle]
+            else:
+                median = 0.5 * (ordered[middle - 1] + ordered[middle])
+            p95_index = min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)
+            return median, ordered[p95_index]
+
+        ask_median, ask_p95 = _summary(state.local_ask_timings)
+        study_median, _ = _summary(state.local_study_ask_timings)
+        suggest_median, _ = _summary(state.local_suggest_timings)
+        evaluate_median, evaluate_p95 = _summary(state.local_evaluate_timings)
+        tell_median, _ = _summary(state.local_tell_timings)
+        if state.local_gpu_idle_timings:
+            gpu_idle_median, gpu_idle_p95 = _summary(
+                state.local_gpu_idle_timings
+            )
+        else:
+            gpu_idle_median, gpu_idle_p95 = 0.0, 0.0
+        _log_master(
+            f"[{state.run}] local timing n={len(state.local_ask_timings)} "
+            f"ask_med={ask_median:.3f}s ask_p95={ask_p95:.3f}s "
+            f"(study_med={study_median:.3f}s suggest_med={suggest_median:.3f}s) "
+            f"eval_med={evaluate_median:.3f}s eval_p95={evaluate_p95:.3f}s "
+            f"tell_med={tell_median:.3f}s "
+            f"gpu_idle_med={gpu_idle_median:.3f}s "
+            f"gpu_idle_p95={gpu_idle_p95:.3f}s"
+        )
+
+    def _evaluate_local_task(
+        state: RunState,
+        info: TaskInfo,
+        ask_seconds: float,
+    ) -> None:
+        nonlocal last_local_evaluation_finished_at
+        _ensure_local_context(state)
+        _refresh_run_lease(dirs, state.run, local_owner)
+        evaluate_started = time.perf_counter()
+        gpu_idle_seconds = (
+            max(0.0, evaluate_started - last_local_evaluation_finished_at)
+            if last_local_evaluation_finished_at is not None
+            else None
+        )
+        payload: Dict[str, Any]
+        for attempt in range(max_retries + 1):
+            try:
+                eval_result = evaluate_run(state.context, info.params)
+                payload = {
+                    "task_id": info.task_id,
+                    "run": state.run,
+                    "phase": info.phase,
+                    "seq": info.seq,
+                    "params": info.params,
+                    "objective": eval_result.objective,
+                    "feasible": eval_result.feasible,
+                    "status": eval_result.status,
+                    "metrics": {
+                        key: {
+                            "injected_full": value.injected_full,
+                            "total_full": value.total_full,
+                        }
+                        for key, value in eval_result.metrics.items()
+                    },
+                    "debug_pre": None,
+                    "debug_scale": None,
+                    "debug_params": None,
+                    "attempt": attempt,
+                    "worker_id": local_owner,
+                    "hostname": _hostname(),
+                    "evaluation_backend": getattr(
+                        state.context,
+                        "_evaluation_backend",
+                        local_eval_backend,
+                    ),
+                    "model_identity": _context_model_identity(state.context),
+                    "provenance": local_provenance,
+                }
+            except Exception as exc:  # noqa: BLE001
+                payload = {
+                    "task_id": info.task_id,
+                    "run": state.run,
+                    "phase": info.phase,
+                    "seq": info.seq,
+                    "params": info.params,
+                    "objective": PENALTY_VALUE,
+                    "feasible": False,
+                    "status": f"eval-error:{exc}",
+                    "metrics": {},
+                    "attempt": attempt,
+                    "worker_id": local_owner,
+                    "hostname": _hostname(),
+                    "evaluation_backend": local_eval_backend,
+                    "model_identity": _context_model_identity(state.context),
+                    "provenance": local_provenance,
+                    "error_traceback": traceback.format_exc(),
+                }
+            if not str(payload["status"]).startswith("eval-error"):
+                break
+            if attempt < max_retries:
+                _log_master(
+                    f"[{state.run}] local retry seq={info.seq} "
+                    f"attempt={attempt + 1}/{max_retries}"
+                )
+        evaluation_finished_at = time.perf_counter()
+        evaluate_seconds = evaluation_finished_at - evaluate_started
+        last_local_evaluation_finished_at = evaluation_finished_at
+        tell_seconds = _record_result(
+            state,
+            info,
+            payload,
+            schedule_sanity=False,
+        )
+        done_path = dirs["done"] / f"{info.task_id}__local_master.json"
+        if not _safe_write_json(
+            done_path,
+            {
+                "task_id": info.task_id,
+                "run": state.run,
+                "phase": info.phase,
+                "seq": info.seq,
+                "params": info.params,
+                "completed_at": _now(),
+                "worker_id": local_owner,
+                "evaluation_backend": local_eval_backend,
+                "status": payload["status"],
+            },
+            attempts=8,
+            delay=0.05,
+        ):
+            raise OSError(f"Could not write local completion marker: {done_path}")
+        _write_local_checkpoint(
+            state,
+            info,
+            ask_seconds=ask_seconds,
+            evaluate_seconds=evaluate_seconds,
+            tell_seconds=tell_seconds,
+            gpu_idle_seconds=gpu_idle_seconds,
+        )
+        _record_local_timing_summary(
+            state,
+            info,
+            ask_seconds=ask_seconds,
+            evaluate_seconds=evaluate_seconds,
+            tell_seconds=tell_seconds,
+            gpu_idle_seconds=gpu_idle_seconds,
+        )
+        _refresh_run_lease(dirs, state.run, local_owner)
+        gpu_idle_text = (
+            f"{gpu_idle_seconds:.3f}s"
+            if gpu_idle_seconds is not None
+            else "n/a"
+        )
+        _log_master(
+            f"[{state.run}] local seq={info.seq} phase={info.phase} "
+            f"objective={float(payload['objective']):.9g} "
+            f"ask={ask_seconds:.3f}s "
+            f"(study={info.study_ask_seconds:.3f}s "
+            f"suggest={info.suggest_seconds:.3f}s) "
+            f"eval={evaluate_seconds:.3f}s "
+            f"tell={tell_seconds:.3f}s "
+            f"gpu_idle={gpu_idle_text}"
+        )
+
+    def _advance_local_run() -> Optional[str]:
+        nonlocal local_run, last_local_evaluation_finished_at
+        previous = local_run
+        if previous:
+            _release_run_lease(dirs, previous, local_owner)
+        local_run = None
+        for candidate in runs:
+            state = run_states.get(candidate)
+            if _run_is_complete(dirs, candidate):
+                continue
+            if state is None or state.phase != "done":
+                local_run = candidate
+                break
+        if local_run and local_run != previous:
+            last_local_evaluation_finished_at = None
+            _log_master(f"local runner ownership -> {local_run}")
+        return local_run
+
+    def _cleanup_local_runner() -> None:
+        if not local_eval_enabled:
+            return
+        for state in list(run_states.values()):
+            _release_run_context(state)
+        _release_run_lease(dirs, local_run, local_owner)
+
+    atexit.register(_cleanup_local_runner)
 
     while True:
         _log_master_mem()
@@ -2628,7 +3451,10 @@ def master_main(args: argparse.Namespace) -> None:
                 _safe_unlink(_ip_path)
                 _log_master(f"reaped orphan in_progress {_ip_path.name} (untracked)")
 
-        # Enqueue tasks
+        # Enqueue tasks. One run can instead be owned and evaluated locally with
+        # a persistent context, while the remaining runs continue through the
+        # distributed queue.
+        local_work_performed = False
         active_runs = _pick_run_order(
             runs,
             args.run_mode,
@@ -2637,6 +3463,8 @@ def master_main(args: argparse.Namespace) -> None:
             max(0, int(getattr(args, "max_active_runs", 0) or 0)),
         )
         for run in active_runs:
+            if local_eval_enabled and run != local_run:
+                continue
             state = run_states.get(run)
             if state is None:
                 state = _init_run_state(run)
@@ -2650,6 +3478,38 @@ def master_main(args: argparse.Namespace) -> None:
             ):
                 state.phase = "optuna"
 
+            if local_eval_enabled and run == local_run:
+                local_info, ask_seconds = _next_local_task(state)
+                if local_info is not None:
+                    _evaluate_local_task(state, local_info, ask_seconds)
+                    local_work_performed = True
+                    continue
+                if state.phase == "optuna" and state.optuna_done >= state.max_iters:
+                    state.phase = "done"
+                    _cf = state.context.calibration_folder
+                    out_folder = (
+                        _cf.parent / (_cf.name + "_auto_opt")
+                        if _cf
+                        else logs_dir / f"{state.run}_auto_opt"
+                    )
+                    _finalize_run(
+                        state,
+                        logs_dir,
+                        out_folder,
+                        save_calibration=not args.no_save_calibration,
+                    )
+                    _mark_run_complete(
+                        dirs,
+                        state.run,
+                        owner=local_owner,
+                    )
+                    _safe_unlink(
+                        logs_dir / f"tmp_auto_calibration_{state.run}.csv"
+                    )
+                    _release_completed_run_state(state)
+                    _advance_local_run()
+                    local_work_performed = True
+                continue
             # Limit in-flight per run (optionally overridden by control dir).
             in_flight_run = sum(1 for t in in_flight.values() if t.run == run)
             limit_override = _read_inflight_limit(args.control_dir)
@@ -2725,8 +3585,17 @@ def master_main(args: argparse.Namespace) -> None:
                 while state.optuna_done + in_flight_run < state.max_iters and (
                     not limit or in_flight_run < limit
                 ):
+                    if state.study is None:
+                        raise RuntimeError(
+                            f"[{state.run}] Optuna study was released before dispatch"
+                        )
+                    generation_started = time.perf_counter()
                     trial = state.study.ask()
+                    study_ask_seconds = time.perf_counter() - generation_started
+                    suggest_started = time.perf_counter()
                     params = suggest_params_trial(trial, state.context.param_space)
+                    suggest_seconds = time.perf_counter() - suggest_started
+                    generation_seconds = time.perf_counter() - generation_started
                     seq = state.next_iter
                     state.next_iter += 1
                     task_id = _make_task_id(run, "optuna", seq)
@@ -2751,6 +3620,15 @@ def master_main(args: argparse.Namespace) -> None:
                     _atomic_write_json(dirs["pending"] / f"{task_id}.json", payload)
                     in_flight[task_id] = TaskInfo(task_id, run, "optuna", seq, params, trial, attempt=0)
                     in_flight_run += 1
+                    generated_count = state.optuna_done + in_flight_run
+                    if generation_seconds >= 1.0 or generated_count % 100 == 0:
+                        _log_master(
+                            f"[{state.run}] Optuna dispatch timing "
+                            f"completed_or_inflight={generated_count}/{state.max_iters} "
+                            f"total={generation_seconds:.3f}s "
+                            f"study={study_ask_seconds:.3f}s "
+                            f"suggest={suggest_seconds:.3f}s"
+                        )
                 if state.optuna_done >= state.max_iters:
                     state.phase = "done"
                     _cf = state.context.calibration_folder
@@ -2761,9 +3639,14 @@ def master_main(args: argparse.Namespace) -> None:
                         out_folder,
                         save_calibration=not args.no_save_calibration,
                     )
+                    _mark_run_complete(
+                        dirs,
+                        state.run,
+                        owner=f"master:{_hostname()}:{os.getpid()}",
+                    )
                     temp_path = logs_dir / f"tmp_auto_calibration_{state.run}.csv"
                     _safe_unlink(temp_path)
-                    _release_run_context(state)
+                    _release_completed_run_state(state)
                     if args.run_mode == "serial":
                         idx = runs.index(run)
                         active_run = runs[idx + 1] if idx + 1 < len(runs) else None
@@ -2780,7 +3663,8 @@ def master_main(args: argparse.Namespace) -> None:
                 _log_master_mem(force=True)
                 break
             _log_master("completion marker write failed; retrying")
-        time.sleep(poll)
+        if not local_work_performed:
+            time.sleep(poll)
 
 
 def worker_loop(args: argparse.Namespace) -> None:
@@ -2933,13 +3817,19 @@ def worker_loop(args: argparse.Namespace) -> None:
                 release_images=True,
             )
         except RuntimeError as exc:
-            if requested_backend != "auto" or worker_evaluation_backend != "cuda":
+            if (
+                requested_backend != "auto"
+                or worker_evaluation_backend not in {"cuda", "opencl"}
+            ):
                 raise
             print(
-                f"[{worker_id}] CUDA initialization failed; falling back to "
+                f"[{worker_id}] {worker_evaluation_backend} initialization "
+                "failed; falling back to "
                 f"prepared CPU evaluation: {exc}"
             )
-            setattr(ctx, "_cuda_fallback_reason", str(exc))
+            setattr(ctx, "_accelerator_fallback_reason", str(exc))
+            if worker_evaluation_backend == "cuda":
+                setattr(ctx, "_cuda_fallback_reason", str(exc))
             prepare_evaluation_context(
                 ctx,
                 backend="prepared",
@@ -2955,22 +3845,34 @@ def worker_loop(args: argparse.Namespace) -> None:
         getattr(args, "eval_backend", "prepared") or "prepared"
     ).strip().lower()
     cuda_workers = max(0, int(getattr(args, "cuda_workers", 0) or 0))
+    opencl_workers = max(0, int(getattr(args, "opencl_workers", 0) or 0))
     if requested_backend == "auto":
-        worker_evaluation_backend = (
-            "cuda"
-            if worker_index is not None and worker_index < cuda_workers
-            else "prepared"
-        )
+        if worker_index is not None and worker_index < cuda_workers:
+            worker_evaluation_backend = "cuda"
+        elif (
+            worker_index is not None
+            and worker_index < cuda_workers + opencl_workers
+        ):
+            worker_evaluation_backend = "opencl"
+        else:
+            worker_evaluation_backend = "prepared"
     else:
         worker_evaluation_backend = requested_backend
-    cuda_has_cpu_peer = (
+    accelerator_has_cpu_peer = (
         requested_backend == "auto"
-        and worker_evaluation_backend == "cuda"
-        and cuda_workers < max(1, int(getattr(args, "workers", 1) or 1))
+        and worker_evaluation_backend in {"cuda", "opencl"}
+        and cuda_workers + opencl_workers
+        < max(1, int(getattr(args, "workers", 1) or 1))
     )
     poll = max(0.5, args.poll_seconds)
     proc = psutil.Process(os.getpid()) if psutil else None
     stickiness_wait = max(0.0, float(getattr(args, "stickiness_wait_seconds", 0.0) or 0.0))
+    run_affinity = str(getattr(args, "run_affinity", "auto") or "auto").lower()
+    use_run_leases = run_affinity != "off"
+    strict_run_affinity = run_affinity == "strict" or (
+        run_affinity == "auto"
+        and worker_evaluation_backend in {"cuda", "opencl"}
+    )
 
     thread_limit = getattr(args, "thread_limit", None)
     _set_thread_env(thread_limit)
@@ -3020,6 +3922,25 @@ def worker_loop(args: argparse.Namespace) -> None:
     heartbeat_path = heartbeat_dir / f"{worker_id}.json"
     heartbeat_interval = max(1.0, float(args.heartbeat_seconds))
     sanity_lock_stale = max(heartbeat_interval * 2.0, 120.0)
+    run_lease_stale = max(
+        heartbeat_interval * 3.0,
+        float(getattr(args, "worker_stall_seconds", 0.0) or 0.0),
+        180.0,
+    )
+    if last_run and _run_is_complete(dirs, last_run):
+        last_run = None
+        _write_worker_state(log_dir, worker_id, {"last_run": None})
+    if last_run and use_run_leases:
+        if not _acquire_run_lease(
+            dirs,
+            str(last_run),
+            worker_id,
+            worker_hostname,
+            worker_evaluation_backend,
+            stale_seconds=run_lease_stale,
+        ):
+            last_run = None
+            _write_worker_state(log_dir, worker_id, {"last_run": None})
     task_lock = threading.Lock()
     current_task: Dict[str, Any] = {
         "task_id": None,
@@ -3087,11 +4008,13 @@ def worker_loop(args: argparse.Namespace) -> None:
                 payload["task_age_seconds"] = now - float(started_at)
             payload.update(mem_snapshot)
             ok = _safe_write_json(heartbeat_path, payload)
+            if use_run_leases and last_run:
+                _refresh_run_lease(dirs, last_run, worker_id)
             if not ok:
                 if now - last_heartbeat_error > 60:
                     print(f"[{worker_id}] heartbeat write failed; will retry")
                     last_heartbeat_error = now
-            time.sleep(heartbeat_interval)
+            stop_event.wait(heartbeat_interval)
 
     heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     heartbeat_thread.start()
@@ -3102,6 +4025,8 @@ def worker_loop(args: argparse.Namespace) -> None:
             heartbeat_thread.join(timeout=heartbeat_interval + 1.0)
         except Exception:
             pass
+        if use_run_leases and last_run:
+            _release_run_lease(dirs, last_run, worker_id)
         try:
             if heartbeat_path.exists():
                 heartbeat_path.unlink()
@@ -3158,9 +4083,57 @@ def worker_loop(args: argparse.Namespace) -> None:
             preferred_run = last_run
             sanity_lock_active = _sanity_lock_active(args.control_dir, worker_hostname, sanity_lock_stale)
             if last_run:
+                if _run_is_complete(dirs, last_run):
+                    print(f"[{worker_id}] run {last_run} complete; releasing persistent context")
+                    _write_worker_state(log_dir, worker_id, {"last_run": None})
+                    _shutdown_worker("run-complete")
+                    return
                 pending_for_last = _count_pending_for_run(last_run)
                 in_progress_for_last = _count_in_progress_for_run(last_run)
-                if pending_for_last == 0 and stickiness_wait > 0:
+                if pending_for_last == 0 and strict_run_affinity:
+                    while pending_for_last == 0:
+                        if _queue_is_complete(queue):
+                            _shutdown_worker("master-complete")
+                            return
+                        if _run_is_complete(dirs, last_run):
+                            print(
+                                f"[{worker_id}] run {last_run} complete; "
+                                "releasing persistent context"
+                            )
+                            _write_worker_state(
+                                log_dir,
+                                worker_id,
+                                {"last_run": None},
+                            )
+                            _shutdown_worker("run-complete")
+                            return
+                        limit = _read_worker_limit(
+                            args.control_dir,
+                            worker_hostname,
+                        )
+                        if (
+                            limit is not None
+                            and worker_index is not None
+                            and worker_index >= limit
+                        ):
+                            _shutdown_worker("limit")
+                            return
+                        if _worker_context_is_idle(
+                            context_cache,
+                            last_task_finished_at,
+                            idle_exit_seconds,
+                        ):
+                            _write_worker_state(
+                                log_dir,
+                                worker_id,
+                                {"last_run": None},
+                            )
+                            _shutdown_worker("idle-context-timeout")
+                            return
+                        _refresh_run_lease(dirs, last_run, worker_id)
+                        time.sleep(poll)
+                        pending_for_last = _count_pending_for_run(last_run)
+                elif pending_for_last == 0 and stickiness_wait > 0:
                     waited = 0.0
                     while waited < stickiness_wait:
                         time.sleep(min(poll, stickiness_wait - waited))
@@ -3168,26 +4141,67 @@ def worker_loop(args: argparse.Namespace) -> None:
                         pending_for_last = _count_pending_for_run(last_run)
                         if pending_for_last > 0:
                             break
-                if pending_for_last == 0:
+                if pending_for_last == 0 and not strict_run_affinity:
                     preferred_run = None
+            blocked_runs = (
+                _runs_leased_by_others(
+                    dirs,
+                    worker_id,
+                    stale_seconds=run_lease_stale,
+                )
+                if use_run_leases
+                else set()
+            )
             for _ in range(MAX_CLAIM_ATTEMPTS):
                 task_path = _select_pending_task(
                     dirs,
                     worker_id,
                     preferred_run=preferred_run,
-                    allow_sanity=not sanity_lock_active and not cuda_has_cpu_peer,
+                    allow_sanity=(
+                        not sanity_lock_active and not accelerator_has_cpu_peer
+                    ),
+                    blocked_runs=blocked_runs,
                 )
                 if not task_path:
                     break
+                task_info = _pending_task_info(task_path)
+                candidate_run = task_info[0] if task_info else None
                 claimed = dirs["in_progress"] / f"{task_path.stem}__{worker_id}.json"
                 try:
                     os.replace(task_path, claimed)
-                    break
                 except OSError as exc:
                     print(f"[{worker_id}] claim failed for {task_path.name}: {exc}")
                     claimed = None
                     time.sleep(random.uniform(0.0, CLAIM_JITTER_MAX_SECONDS))
                     continue
+                if (
+                    use_run_leases
+                    and candidate_run
+                    and (last_run is None or candidate_run == last_run)
+                ):
+                    if not _acquire_run_lease(
+                        dirs,
+                        candidate_run,
+                        worker_id,
+                        worker_hostname,
+                        worker_evaluation_backend,
+                        stale_seconds=run_lease_stale,
+                    ):
+                        try:
+                            os.replace(claimed, task_path)
+                        except OSError:
+                            pass
+                        blocked_runs.add(candidate_run)
+                        claimed = None
+                        continue
+                    if last_run is None:
+                        last_run = candidate_run
+                        _write_worker_state(
+                            log_dir,
+                            worker_id,
+                            {"last_run": last_run},
+                        )
+                break
             if claimed is None:
                 time.sleep(poll)
                 if args.once:
@@ -3237,6 +4251,25 @@ def worker_loop(args: argparse.Namespace) -> None:
             _write_worker_state(log_dir, worker_id, {"last_run": None})
             _shutdown_worker("run-switch")
             return
+        if use_run_leases and run_name:
+            if not _acquire_run_lease(
+                dirs,
+                str(run_name),
+                worker_id,
+                worker_hostname,
+                worker_evaluation_backend,
+                stale_seconds=run_lease_stale,
+            ):
+                base_name = claimed.stem.split("__", 1)[0]
+                pending_path = dirs["pending"] / f"{base_name}.json"
+                try:
+                    os.replace(claimed, pending_path)
+                except OSError:
+                    pass
+                last_run = None
+                _write_worker_state(log_dir, worker_id, {"last_run": None})
+                time.sleep(poll)
+                continue
         with task_lock:
             current_task["task_id"] = payload.get("task_id")
             current_task["run"] = payload.get("run")
@@ -3409,6 +4442,11 @@ def worker_loop(args: argparse.Namespace) -> None:
                 "cuda_fallback_reason": getattr(
                     ctx,
                     "_cuda_fallback_reason",
+                    None,
+                ),
+                "accelerator_fallback_reason": getattr(
+                    ctx,
+                    "_accelerator_fallback_reason",
                     None,
                 ),
                 "model_identity": model_identity,
@@ -3814,12 +4852,27 @@ def build_parser() -> argparse.ArgumentParser:
         const=True,
         default=False,
         type=_parse_bool,
-        help="Persist Optuna study to sqlite (true/false).",
+        help="Persist Optuna study to sqlite (true/false). Local GPU runs are "
+             "faster with the default in-memory study and recover from CSV/checkpoints.",
     )
     master.add_argument(
         "--optuna-storage-dir",
         default=None,
-        help="Directory to store Optuna sqlite DBs (defaults to --logs-dir).",
+        help="Directory for Optuna sqlite DBs and local-runner checkpoints "
+             "(defaults to --logs-dir).",
+    )
+    master.add_argument(
+        "--local-eval-backend",
+        choices=["off", "prepared", "cuda", "opencl"],
+        default="off",
+        help="Evaluate one run at a time inside the master with a persistent "
+             "context. This bypasses the per-trial file queue for that run.",
+    )
+    master.add_argument(
+        "--local-run",
+        default=None,
+        help="Optional first run owned by --local-eval-backend. Remaining runs "
+             "are selected in --runs order after it completes.",
     )
     master.add_argument(
         "--use-last-best",
@@ -4014,9 +5067,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--threads-per-worker", dest="thread_limit", type=int, default=None)
     worker.add_argument(
         "--eval-backend",
-        choices=["legacy", "prepared", "cuda", "auto"],
+        choices=["legacy", "prepared", "cuda", "opencl", "auto"],
         default="prepared",
-        help="Evaluation backend. 'prepared' reuses color projections; 'cuda' is optional.",
+        help="Evaluation backend. GPU backends are optional.",
     )
     worker.add_argument(
         "--cuda-workers",
@@ -4024,12 +5077,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="With --eval-backend auto, assign worker indices below N to CUDA.",
     )
+    worker.add_argument(
+        "--opencl-workers",
+        type=int,
+        default=0,
+        help="With --eval-backend auto, assign the next N workers to OpenCL.",
+    )
     worker.add_argument("--poll-seconds", type=float, default=1.0)
     worker.add_argument(
         "--stickiness-wait-seconds",
         type=float,
         default=20.0,
         help="Wait briefly for new tasks for the last run before switching runs.",
+    )
+    worker.add_argument(
+        "--run-affinity",
+        choices=["auto", "strict", "prefer", "off"],
+        default="auto",
+        help="Run ownership policy. auto uses strict leases for CUDA and preferred "
+             "leases for CPU; strict never changes run before completion.",
     )
     worker.add_argument("--worker-id", default=None)
     worker.add_argument("--heartbeat-seconds", type=float, default=60.0)
@@ -4130,6 +5196,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Wait briefly for new tasks for the last run before switching runs.",
     )
+    watchdog.add_argument(
+        "--run-affinity",
+        choices=["auto", "strict", "prefer", "off"],
+        default="auto",
+        help="Run ownership policy passed to managed workers.",
+    )
     watchdog.add_argument("--worker-id", default=None)
     watchdog.add_argument("--once", action="store_true")
     watchdog.add_argument("--stagger-seconds", type=float, default=0.0)
@@ -4140,7 +5212,7 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog.add_argument("--threads-per-worker", dest="thread_limit", type=int, default=None)
     watchdog.add_argument(
         "--eval-backend",
-        choices=["legacy", "prepared", "cuda", "auto"],
+        choices=["legacy", "prepared", "cuda", "opencl", "auto"],
         default="prepared",
         help="Evaluation backend passed to managed workers.",
     )
@@ -4149,6 +5221,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="With --eval-backend auto, assign worker indices below N to CUDA.",
+    )
+    watchdog.add_argument(
+        "--opencl-workers",
+        type=int,
+        default=0,
+        help="With --eval-backend auto, assign the next N workers to OpenCL.",
     )
     watchdog.add_argument(
         "--max-tasks-per-worker",

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import socket
+import time
 from types import SimpleNamespace
 
 import darsia
@@ -26,13 +29,21 @@ from scripts.auto_calibrate_color_to_mass import (
     prepare_evaluation_context,
 )
 from scripts.distributed_auto_calibration_queue import (
+    RunState,
+    _acquire_run_lease,
     _context_model_identity,
+    _ensure_queue_dirs,
     _generate_warmup_params,
+    _mark_run_complete,
+    _release_completed_run_state,
+    _release_run_context,
+    _release_run_lease,
     _result_provenance_summary,
     _select_pending_task,
     _task_payload,
 )
 from scripts.ffac_titration_flash import TitrationFlash
+from scripts.opencl_integrated_evaluator import OpenCLIntegratedEvaluator
 
 
 class _ArrayImage:
@@ -108,6 +119,8 @@ def test_evaluation_backend_aliases_and_validation():
     assert _normalise_evaluation_backend("fast") == "prepared"
     assert _normalise_evaluation_backend("off") == "legacy"
     assert _normalise_evaluation_backend("cuda") == "cuda"
+    assert _normalise_evaluation_backend("ocl") == "opencl"
+    assert _normalise_evaluation_backend("opencl") == "opencl"
     with pytest.raises(ValueError, match="Unknown evaluation backend"):
         _normalise_evaluation_backend("invalid")
 
@@ -211,6 +224,159 @@ def test_cpu_task_selection_prioritizes_sanity_over_preferred_run(tmp_path):
     assert selected_without_sanity == dirs["pending"] / "ac20_warmup.json"
 
 
+def test_task_selection_excludes_runs_leased_by_other_workers(tmp_path):
+    dirs = {
+        "pending": tmp_path / "pending",
+        "in_progress": tmp_path / "in_progress",
+    }
+    for path in dirs.values():
+        path.mkdir()
+    blocked = dirs["pending"] / "ac20_optuna.json"
+    blocked.write_text(
+        '{"run":"ac20","phase":"optuna","seq":1}',
+        encoding="utf-8",
+    )
+    available = dirs["pending"] / "ac27_optuna.json"
+    available.write_text(
+        '{"run":"ac27","phase":"optuna","seq":2}',
+        encoding="utf-8",
+    )
+
+    selected = _select_pending_task(
+        dirs,
+        "Olav_0",
+        blocked_runs={"ac20"},
+    )
+
+    assert selected == available
+
+
+def test_run_lease_is_exclusive_releasable_and_closed_by_completion(tmp_path):
+    dirs = _ensure_queue_dirs(tmp_path / "queue")
+
+    assert _acquire_run_lease(
+        dirs,
+        "ac20",
+        "gpu_0",
+        "Moderskipet",
+        "cuda",
+        stale_seconds=600,
+    )
+    assert not _acquire_run_lease(
+        dirs,
+        "ac20",
+        "cpu_0",
+        "Olav",
+        "prepared",
+        stale_seconds=600,
+    )
+
+    _release_run_lease(dirs, "ac20", "gpu_0")
+    assert _acquire_run_lease(
+        dirs,
+        "ac20",
+        "cpu_0",
+        "Olav",
+        "prepared",
+        stale_seconds=600,
+    )
+
+    _release_run_lease(dirs, "ac20", "cpu_0")
+    _mark_run_complete(dirs, "ac20", owner="test")
+    assert not _acquire_run_lease(
+        dirs,
+        "ac20",
+        "gpu_0",
+        "Moderskipet",
+        "cuda",
+        stale_seconds=600,
+    )
+
+
+def test_fresh_lease_from_dead_local_process_is_reclaimed(tmp_path):
+    dirs = _ensure_queue_dirs(tmp_path / "queue")
+    lease = dirs["run_leases"] / "ac20.json"
+    lease.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run": "ac20",
+                "worker_id": "old_local_master",
+                "hostname": socket.gethostname(),
+                "backend": "cuda",
+                "pid": 2_000_000_000,
+                "acquired_at": time.time(),
+                "updated_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _acquire_run_lease(
+        dirs,
+        "ac20",
+        "new_local_master",
+        socket.gethostname(),
+        "cuda",
+        stale_seconds=600,
+    )
+
+
+def test_release_run_context_closes_accelerator_evaluators():
+    class _Evaluator:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    cuda_evaluator = _Evaluator()
+    opencl_evaluator = _Evaluator()
+    context = SimpleNamespace(
+        _cuda_evaluator=cuda_evaluator,
+        _opencl_evaluator=opencl_evaluator,
+    )
+    state = RunState(
+        run="ac20",
+        context=context,
+        label_weights={},
+        study=None,
+        warmup_params=[{"a": 1.0}],
+        max_iters=1,
+        distributions={},
+    )
+
+    _release_run_context(state)
+
+    assert cuda_evaluator.closed
+    assert opencl_evaluator.closed
+    assert state.context is None
+    assert state.warmup_params == []
+
+
+def test_release_completed_run_state_discards_optimizer_history():
+    state = RunState(
+        run="ac20",
+        context=None,
+        label_weights={},
+        study=SimpleNamespace(),
+        warmup_params=[],
+        max_iters=1,
+        distributions={"a": SimpleNamespace()},
+        history=[{"iter": 0}],
+        local_ask_timings=[0.1],
+        local_evaluate_timings=[0.2],
+    )
+
+    _release_completed_run_state(state)
+
+    assert state.study is None
+    assert state.history == []
+    assert state.distributions == {}
+    assert state.local_ask_timings == []
+    assert state.local_evaluate_timings == []
+
+
 def _cuda_available() -> bool:
     try:
         import cupy as cp
@@ -220,7 +386,20 @@ def _cuda_available() -> bool:
         return False
 
 
-@pytest.mark.skipif(not _cuda_available(), reason="CUDA/CuPy is not available")
+def _opencl_available() -> bool:
+    try:
+        import pyopencl as cl
+
+        return any(
+            device.type & cl.device_type.GPU
+            for platform in cl.get_platforms()
+            for device in platform.get_devices()
+        )
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("evaluator_name", ["cuda", "opencl"])
 @pytest.mark.parametrize(
     ("phase_separation", "gas_scores", "expected"),
     [
@@ -232,11 +411,17 @@ def _cuda_available() -> bool:
         ),
     ],
 )
-def test_cuda_integrated_evaluator_matches_phase_algebra(
+def test_integrated_evaluator_matches_phase_algebra(
+    evaluator_name,
     phase_separation,
     gas_scores,
     expected,
 ):
+    if evaluator_name == "cuda" and not _cuda_available():
+        pytest.skip("CUDA/CuPy is not available")
+    if evaluator_name == "opencl" and not _opencl_available():
+        pytest.skip("OpenCL/PyOpenCL is not available")
+
     class _Geometry:
         cached_voxel_volume = np.ones((1, 2), dtype=np.float64)
 
@@ -279,7 +464,11 @@ def test_cuda_integrated_evaluator_matches_phase_algebra(
         _gas_scores=gas_scores,
     )
 
-    evaluator = _CudaIntegratedEvaluator(context)
+    evaluator = (
+        _CudaIntegratedEvaluator(context)
+        if evaluator_name == "cuda"
+        else OpenCLIntegratedEvaluator(context, residual_score_clip=2.0)
+    )
     try:
         result = evaluator.evaluate(
             {"gas.residual_onset": 0.2, "gas.residual_width": 0.4}
