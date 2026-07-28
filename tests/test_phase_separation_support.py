@@ -17,10 +17,13 @@ from scripts.ac_production_campaign import (
     build_parser as build_campaign_parser,
 )
 from scripts.auto_calibrate_color_to_mass import (
+    _CudaIntegratedEvaluator,
     _mass_result_for_evaluation,
+    _normalise_evaluation_backend,
     _normalise_phase_separation,
     _regularize_color_paths,
     evaluate_run,
+    prepare_evaluation_context,
 )
 from scripts.distributed_auto_calibration_queue import (
     _generate_warmup_params,
@@ -43,6 +46,145 @@ class _Calibration:
 
     def __call__(self, image):
         return self.result
+
+
+class _PreparedCalibration:
+    def __init__(self):
+        self.color_calls = 0
+        self.full_calls = 0
+        self.downstream_calls = 0
+
+    def call_color_interpretation(self, image):
+        self.color_calls += 1
+        return _ArrayImage(image.img + 1.0)
+
+    def call_pH_analysis(self, color):
+        self.downstream_calls += 1
+        return _ArrayImage(color.img * 2.0)
+
+    def call_flash_and_mass_analysis(self, signal):
+        return SimpleNamespace(mass=_ArrayImage(signal.img))
+
+    def __call__(self, image):
+        self.full_calls += 1
+        return SimpleNamespace(mass=_ArrayImage(image.img * 2.0))
+
+
+def test_prepared_evaluation_reuses_color_projection_and_releases_rgb():
+    calibration = _PreparedCalibration()
+    context = SimpleNamespace(
+        run="ac20",
+        calibration=calibration,
+        _loaded=[
+            (_ArrayImage([[1.0, 2.0]]), 1.0, 0.5),
+            (_ArrayImage([[3.0, 4.0]]), 2.0, 1.0),
+        ],
+        _prepared_colors=[],
+        _evaluation_backend="legacy",
+        phase_separation="shared-signal",
+    )
+
+    prepare_evaluation_context(context, backend="prepared", release_images=True)
+
+    assert calibration.color_calls == 2
+    assert context._evaluation_backend == "prepared"
+    assert all(image is None for image, _injected, _time in context._loaded)
+
+    first = _mass_result_for_evaluation(context, None, 0, {})
+    second = _mass_result_for_evaluation(context, None, 0, {})
+
+    assert calibration.full_calls == 0
+    assert calibration.downstream_calls == 2
+    np.testing.assert_allclose(first.mass.img, [[4.0, 6.0]])
+    np.testing.assert_allclose(second.mass.img, first.mass.img)
+
+
+def test_evaluation_backend_aliases_and_validation():
+    assert _normalise_evaluation_backend("cpu") == "prepared"
+    assert _normalise_evaluation_backend("fast") == "prepared"
+    assert _normalise_evaluation_backend("off") == "legacy"
+    assert _normalise_evaluation_backend("cuda") == "cuda"
+    with pytest.raises(ValueError, match="Unknown evaluation backend"):
+        _normalise_evaluation_backend("invalid")
+
+
+def _cuda_available() -> bool:
+    try:
+        import cupy as cp
+
+        return cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA/CuPy is not available")
+@pytest.mark.parametrize(
+    ("phase_separation", "gas_scores", "expected"),
+    [
+        ("shared-signal", [], (2.6875, 1.0, 1.6875)),
+        (
+            "residual-gas",
+            [np.array([[0, 255]], dtype=np.uint8)],
+            (3.125, 2.0, 1.125),
+        ),
+    ],
+)
+def test_cuda_integrated_evaluator_matches_phase_algebra(
+    phase_separation,
+    gas_scores,
+    expected,
+):
+    class _Geometry:
+        cached_voxel_volume = np.ones((1, 2), dtype=np.float64)
+
+        def _prepare_cached_voxel_volume(self, _shape):
+            return None
+
+    class _ExpertAdapter:
+        def mask_for(self, _image, mode):
+            if mode == "saturation_g":
+                return np.array([[True, False]])
+            return np.array([[True, True]])
+
+    signal_model = SimpleNamespace(
+        supports=np.array([0.0, 1.0]),
+        values=np.array([0.0, 1.0]),
+    )
+    calibration = SimpleNamespace(
+        labels=_ArrayImage([[1, 1]]),
+        signal_model=SimpleNamespace(model=[None, {1: signal_model}]),
+        flash=SimpleNamespace(
+            min_value_aq=0.0,
+            max_value_aq=1.0,
+            min_value_g=0.5,
+            max_value_g=1.0,
+            restoration=None,
+        ),
+        co2_mass_analysis=SimpleNamespace(
+            density_gaseous_co2=np.full((1, 2), 2.0),
+            solubility_co2=np.full((1, 2), 1.5),
+        ),
+        expert_knowledge_adapter=_ExpertAdapter(),
+    )
+    context = SimpleNamespace(
+        run="test",
+        calibration=calibration,
+        geometry=_Geometry(),
+        signal_labels=[1],
+        phase_separation=phase_separation,
+        _prepared_colors=[_ArrayImage([[0.75, 0.75]])],
+        _gas_scores=gas_scores,
+    )
+
+    evaluator = _CudaIntegratedEvaluator(context)
+    try:
+        result = evaluator.evaluate(
+            {"gas.residual_onset": 0.2, "gas.residual_width": 0.4}
+        )
+    finally:
+        evaluator.close()
+
+    np.testing.assert_allclose(result[0], expected, rtol=1e-7, atol=1e-12)
 
 
 def test_window_balanced_objective_gives_each_operational_window_equal_weight(

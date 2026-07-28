@@ -16,6 +16,11 @@ dependencies = [
     "optuna>=4.9.0",
 ]
 
+[project.optional-dependencies]
+cuda = [
+    "cupy-cuda13x[ctk]>=14.1.1,<15",
+]
+
 [tool.uv]
 package = false
 

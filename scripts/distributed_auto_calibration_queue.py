@@ -70,6 +70,7 @@ from auto_calibrate_color_to_mass import (  # noqa: E402
     apply_label_weight_grouping,
     evaluate_run,
     load_bounds_map,
+    prepare_evaluation_context,
     sample_params,
     save_best_calibration,
     suggest_params_trial,
@@ -2017,9 +2018,22 @@ def master_main(args: argparse.Namespace) -> None:
             if args.use_history and history_source is not None:
                 for trial in _load_history_trials(history_source, distributions):
                     study.add_trial(trial)
+        state_context = ctx
+        if args.no_save_calibration:
+            from types import SimpleNamespace
+
+            state_context = SimpleNamespace(
+                run=ctx.run,
+                param_space=copy.deepcopy(ctx.param_space),
+                calibration_folder=ctx.calibration_folder,
+                _loaded=[],
+            )
+            del ctx
+            gc.collect()
+            _log_master(f"[{run}] compact master context active")
         state = RunState(
             run=run,
-            context=ctx,
+            context=state_context,
             label_weights=run_label_weights,
             study=study,
             warmup_params=warmups,
@@ -2730,6 +2744,7 @@ def worker_loop(args: argparse.Namespace) -> None:
             color_path_anchor,
             color_path_anchor_weight,
             color_path_anchor_strict,
+            worker_evaluation_backend,
         )
         if cache_key in context_cache:
             return context_cache[cache_key]
@@ -2754,12 +2769,43 @@ def worker_loop(args: argparse.Namespace) -> None:
             color_path_anchor_weight=color_path_anchor_weight,
             color_path_anchor_strict=color_path_anchor_strict,
         )
+        try:
+            prepare_evaluation_context(
+                ctx,
+                backend=worker_evaluation_backend,
+                release_images=True,
+            )
+        except RuntimeError as exc:
+            if requested_backend != "auto" or worker_evaluation_backend != "cuda":
+                raise
+            print(
+                f"[{worker_id}] CUDA initialization failed; falling back to "
+                f"prepared CPU evaluation: {exc}"
+            )
+            setattr(ctx, "_cuda_fallback_reason", str(exc))
+            prepare_evaluation_context(
+                ctx,
+                backend="prepared",
+                release_images=True,
+            )
         context_cache[cache_key] = ctx
         return ctx
 
     worker_hostname = _hostname()
     worker_id = args.worker_id or f"{worker_hostname}_{os.getpid()}"
     worker_index = _parse_worker_index(worker_id)
+    requested_backend = str(
+        getattr(args, "eval_backend", "prepared") or "prepared"
+    ).strip().lower()
+    cuda_workers = max(0, int(getattr(args, "cuda_workers", 0) or 0))
+    if requested_backend == "auto":
+        worker_evaluation_backend = (
+            "cuda"
+            if worker_index is not None and worker_index < cuda_workers
+            else "prepared"
+        )
+    else:
+        worker_evaluation_backend = requested_backend
     poll = max(0.5, args.poll_seconds)
     proc = psutil.Process(os.getpid()) if psutil else None
     stickiness_wait = max(0.0, float(getattr(args, "stickiness_wait_seconds", 0.0) or 0.0))
@@ -2774,7 +2820,10 @@ def worker_loop(args: argparse.Namespace) -> None:
     sys.stdout = _Tee(sys.stdout, log_file)
     sys.stderr = _Tee(sys.stderr, log_file)
     thread_note = f" threads={thread_limit}" if thread_limit else ""
-    print(f"[{worker_id}] started host={worker_hostname}{thread_note}")
+    print(
+        f"[{worker_id}] started host={worker_hostname}{thread_note} "
+        f"eval_backend={worker_evaluation_backend}"
+    )
     memmap_mode = os.getenv("DARSIA_MEMMAP_MODE", "off")
     memmap_dir = os.getenv("DARSIA_MEMMAP_DIR", "")
     if memmap_mode and memmap_mode != "off":
@@ -3159,6 +3208,16 @@ def worker_loop(args: argparse.Namespace) -> None:
                 "attempt": attempt,
                 "worker_id": worker_id,
                 "hostname": worker_hostname,
+                "evaluation_backend": getattr(
+                    ctx,
+                    "_evaluation_backend",
+                    worker_evaluation_backend,
+                ),
+                "cuda_fallback_reason": getattr(
+                    ctx,
+                    "_cuda_fallback_reason",
+                    None,
+                ),
                 "max_rss_mb": max_rss,
                 "max_vms_mb": max_vms,
                 "runtime_seconds": _now() - task_start,
@@ -3197,6 +3256,7 @@ def worker_loop(args: argparse.Namespace) -> None:
                 "attempt": attempt,
                 "worker_id": worker_id,
                 "hostname": worker_hostname,
+                "evaluation_backend": worker_evaluation_backend,
                 "max_rss_mb": max_rss,
                 "max_vms_mb": max_vms,
                 "runtime_seconds": _now() - task_start if "task_start" in locals() else None,
@@ -3755,6 +3815,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional directory with per-host worker limits (HOST.txt).",
     )
     worker.add_argument("--threads-per-worker", dest="thread_limit", type=int, default=None)
+    worker.add_argument(
+        "--eval-backend",
+        choices=["legacy", "prepared", "cuda", "auto"],
+        default="prepared",
+        help="Evaluation backend. 'prepared' reuses color projections; 'cuda' is optional.",
+    )
+    worker.add_argument(
+        "--cuda-workers",
+        type=int,
+        default=0,
+        help="With --eval-backend auto, assign worker indices below N to CUDA.",
+    )
     worker.add_argument("--poll-seconds", type=float, default=1.0)
     worker.add_argument(
         "--stickiness-wait-seconds",
@@ -3869,6 +3941,18 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog.add_argument("--worker-id-prefix", default=None)
     watchdog.add_argument("--restart-delay-seconds", type=float, default=5.0)
     watchdog.add_argument("--threads-per-worker", dest="thread_limit", type=int, default=None)
+    watchdog.add_argument(
+        "--eval-backend",
+        choices=["legacy", "prepared", "cuda", "auto"],
+        default="prepared",
+        help="Evaluation backend passed to managed workers.",
+    )
+    watchdog.add_argument(
+        "--cuda-workers",
+        type=int,
+        default=0,
+        help="With --eval-backend auto, assign worker indices below N to CUDA.",
+    )
     watchdog.add_argument(
         "--max-tasks-per-worker",
         type=int,

@@ -108,6 +108,11 @@ class CalibrationContext:
     _loaded: List[Tuple[Any, float, float]] = field(default_factory=list)  # (img, injected, t_hours)
     # Quantized, parameter-independent optical residual used by residual-gas.
     _gas_scores: List[np.ndarray] = field(default_factory=list)
+    # Color-path projection is independent of all Optuna parameters and can be
+    # computed once per frame instead of once per trial.
+    _prepared_colors: List[Any] = field(default_factory=list)
+    _evaluation_backend: str = "legacy"
+    _cuda_evaluator: Any = None
 
 
 # =========================================================================
@@ -1987,13 +1992,343 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
 _EVAL_TB_PRINTED = False
 
 
+def _normalise_evaluation_backend(mode: str | None) -> str:
+    value = (mode or "prepared").strip().lower().replace("_", "-")
+    aliases = {
+        "cpu": "prepared",
+        "fast": "prepared",
+        "numpy": "prepared",
+        "off": "legacy",
+    }
+    value = aliases.get(value, value)
+    if value not in {"legacy", "prepared", "cuda"}:
+        raise ValueError(
+            f"Unknown evaluation backend {mode!r}; expected legacy, prepared, or cuda."
+        )
+    return value
+
+
+class _CudaIntegratedEvaluator:
+    """Evaluate integrated masses while keeping prepared frame data in GPU memory."""
+
+    def __init__(self, context: CalibrationContext) -> None:
+        try:
+            import cupy as cp
+        except ImportError as exc:
+            raise RuntimeError(
+                "CUDA evaluation requires the optional 'cuda' dependency"
+            ) from exc
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            raise RuntimeError("CUDA evaluation requested, but no CUDA device is available")
+        if not context._prepared_colors:
+            raise RuntimeError("CUDA evaluation requires prepared color frames")
+
+        calibration = context.calibration
+        flash = calibration.flash
+        if getattr(flash, "restoration", None) is not None:
+            raise RuntimeError("CUDA evaluation does not support flash restoration")
+
+        shape = tuple(np.asarray(context._prepared_colors[0].img).shape[:2])
+        context.geometry._prepare_cached_voxel_volume(list(shape))
+        voxel_volume = np.asarray(context.geometry.cached_voxel_volume)
+        density = np.asarray(calibration.co2_mass_analysis.density_gaseous_co2)
+        solubility = np.asarray(calibration.co2_mass_analysis.solubility_co2)
+        try:
+            voxel_volume = np.broadcast_to(voxel_volume, shape)
+            density = np.broadcast_to(density, shape)
+            solubility = np.broadcast_to(solubility, shape)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CUDA static-array shape mismatch for {context.run}: "
+                f"shape={shape}, voxel={voxel_volume.shape}, density={density.shape}, "
+                f"solubility={solubility.shape}"
+            ) from exc
+
+        labels = np.asarray(calibration.labels.img)
+        if labels.shape != shape:
+            raise RuntimeError(
+                f"CUDA labels/frame shape mismatch for {context.run}: "
+                f"{labels.shape} != {shape}"
+            )
+
+        self.cp = cp
+        self.context = context
+        self.flash = flash
+        self.phase_separation = _normalise_phase_separation(
+            getattr(context, "phase_separation", "shared-signal")
+        )
+        self.arrival_scale = max(
+            1e-6,
+            float(os.environ.get("FFAC_RESIDUAL_GAS_ARRIVAL_SCALE", "0.02")),
+        )
+        self.label_data: dict[int, dict[str, Any]] = {}
+        weighted_g = voxel_volume * density
+        weighted_aq = voxel_volume * solubility
+        gas_constraint = None
+        aqueous_constraint = None
+        expert_adapter = getattr(calibration, "expert_knowledge_adapter", None)
+        if expert_adapter is not None:
+            reference_frame = context._prepared_colors[0]
+            gas_constraint = expert_adapter.mask_for(
+                reference_frame,
+                "saturation_g",
+            )
+            aqueous_constraint = expert_adapter.mask_for(
+                reference_frame,
+                "concentration_aq",
+            )
+        signal_models = calibration.signal_model.model[1]
+        for label in context.signal_labels:
+            mask = labels == int(label)
+            if not np.any(mask):
+                continue
+            model = signal_models[int(label)]
+            supports = np.asarray(model.supports, dtype=np.float64)
+            self.label_data[int(label)] = {
+                "model": model,
+                "supports": cp.asarray(supports),
+                "weight_g": cp.asarray(np.ascontiguousarray(weighted_g[mask])),
+                "weight_aq": cp.asarray(np.ascontiguousarray(weighted_aq[mask])),
+                "gas_constraint": (
+                    cp.asarray(
+                        np.ascontiguousarray(
+                            np.asarray(gas_constraint, dtype=bool)[mask]
+                        )
+                    )
+                    if gas_constraint is not None
+                    else None
+                ),
+                "aqueous_constraint": (
+                    cp.asarray(
+                        np.ascontiguousarray(
+                            np.asarray(aqueous_constraint, dtype=bool)[mask]
+                        )
+                    )
+                    if aqueous_constraint is not None
+                    else None
+                ),
+                "signals": [
+                    cp.asarray(
+                        np.ascontiguousarray(
+                            np.asarray(frame.img, dtype=np.float64)[mask]
+                        )
+                    )
+                    for frame in context._prepared_colors
+                ],
+            }
+
+        self.gas_scores: list[dict[int, Any]] = []
+        if self.phase_separation == "residual-gas":
+            if len(context._gas_scores) != len(context._prepared_colors):
+                raise RuntimeError(
+                    f"CUDA residual score count mismatch for {context.run}: "
+                    f"{len(context._gas_scores)} != {len(context._prepared_colors)}"
+                )
+            for score in context._gas_scores:
+                score_array = np.asarray(score)
+                self.gas_scores.append(
+                    {
+                        label: cp.asarray(
+                            np.ascontiguousarray(score_array[labels == label])
+                        )
+                        for label in self.label_data
+                    }
+                )
+
+        self.lut_y = (
+            cp.asarray(np.asarray(flash._lut_y, dtype=np.float64))
+            if hasattr(flash, "_lut_y")
+            else None
+        )
+        self.lut_caq = (
+            cp.asarray(np.asarray(flash._lut_caq, dtype=np.float64))
+            if hasattr(flash, "_lut_caq")
+            else None
+        )
+        self.frame_count = len(context._prepared_colors)
+        cp.cuda.get_current_stream().synchronize()
+        free_bytes, total_bytes = cp.cuda.Device().mem_info
+        logger.info(
+            "[%s] CUDA evaluator ready on %s; frames=%d labels=%s "
+            "vram_used_mb=%.0f vram_free_mb=%.0f",
+            context.run,
+            cp.cuda.runtime.getDeviceProperties(0)["name"].decode(),
+            self.frame_count,
+            sorted(self.label_data),
+            (total_bytes - free_bytes) / (1024 * 1024),
+            free_bytes / (1024 * 1024),
+        )
+
+    def evaluate(self, params: Dict[str, Any]) -> list[tuple[float, float, float]]:
+        cp = self.cp
+        values_by_label = {
+            label: cp.asarray(
+                np.asarray(data["model"].values, dtype=np.float64)
+            )
+            for label, data in self.label_data.items()
+        }
+        min_aq = float(self.flash.min_value_aq)
+        max_aq = float(self.flash.max_value_aq)
+        min_g = float(self.flash.min_value_g)
+        max_g = float(self.flash.max_value_g)
+        aq_denom = (max_aq - min_aq) or 1.0
+        gas_denom = (max_g - min_g) or 1.0
+        residual_onset = float(params.get("gas.residual_onset", 0.20))
+        residual_width = max(
+            1e-6,
+            float(params.get("gas.residual_width", 0.40)),
+        )
+
+        totals: list[Any] = []
+        gaseous: list[Any] = []
+        aqueous: list[Any] = []
+        for frame_index in range(self.frame_count):
+            frame_g = cp.asarray(0.0, dtype=cp.float64)
+            frame_aq = cp.asarray(0.0, dtype=cp.float64)
+            for label, data in self.label_data.items():
+                signal = cp.interp(
+                    data["signals"][frame_index],
+                    data["supports"],
+                    values_by_label[label],
+                )
+                y_norm = cp.clip((signal - min_aq) / aq_denom, 0.0, 1.0)
+                if self.lut_y is not None and self.lut_caq is not None:
+                    concentration_aq = cp.interp(
+                        y_norm,
+                        self.lut_y,
+                        self.lut_caq,
+                    )
+                else:
+                    concentration_aq = y_norm
+                if data["aqueous_constraint"] is not None:
+                    concentration_aq *= data["aqueous_constraint"]
+
+                if self.phase_separation == "residual-gas":
+                    concentration_aq = concentration_aq.astype(cp.float32)
+                    score = (
+                        self.gas_scores[frame_index][label].astype(cp.float32)
+                        * cp.float32(_RESIDUAL_GAS_SCORE_CLIP / 255.0)
+                    )
+                    saturation_g = cp.clip(
+                        (score - cp.float32(residual_onset))
+                        / cp.float32(residual_width),
+                        0.0,
+                        1.0,
+                    )
+                    saturation_g *= cp.clip(
+                        concentration_aq / cp.float32(self.arrival_scale),
+                        0.0,
+                        1.0,
+                    )
+                else:
+                    saturation_g = (
+                        cp.clip(signal, min_g, max_g) - min_g
+                    ) / gas_denom
+                    if data["gas_constraint"] is not None:
+                        saturation_g *= data["gas_constraint"]
+
+                frame_g += cp.sum(data["weight_g"] * saturation_g)
+                frame_aq += cp.sum(
+                    data["weight_aq"]
+                    * concentration_aq
+                    * cp.clip(1.0 - saturation_g, 0.0, None)
+                )
+            gaseous.append(frame_g)
+            aqueous.append(frame_aq)
+            totals.append(frame_g + frame_aq)
+
+        values = cp.asnumpy(cp.stack([*totals, *gaseous, *aqueous]))
+        count = self.frame_count
+        return [
+            (
+                float(values[index]),
+                float(values[count + index]),
+                float(values[2 * count + index]),
+            )
+            for index in range(count)
+        ]
+
+    def close(self) -> None:
+        self.label_data.clear()
+        self.gas_scores.clear()
+        self.lut_y = None
+        self.lut_caq = None
+        self.cp.get_default_memory_pool().free_all_blocks()
+
+
+def prepare_evaluation_context(
+    context: CalibrationContext,
+    *,
+    backend: str = "prepared",
+    release_images: bool = True,
+) -> CalibrationContext:
+    """Prepare parameter-independent frame data for repeated trial evaluation."""
+
+    import gc
+    import time
+
+    requested = _normalise_evaluation_backend(backend)
+    if requested == "legacy":
+        context._evaluation_backend = "legacy"
+        return context
+    if not context._prepared_colors:
+        started = time.perf_counter()
+        prepared: list[Any] = []
+        for image, _injected, _time_h in context._loaded:
+            if image is None:
+                raise RuntimeError(
+                    f"[{context.run}] raw calibration images were released before preparation"
+                )
+            prepared.append(context.calibration.call_color_interpretation(image))
+
+        context._prepared_colors = prepared
+        context._evaluation_backend = "prepared"
+        if release_images:
+            context._loaded = [
+                (None, injected, time_h)
+                for _image, injected, time_h in context._loaded
+            ]
+            gc.collect()
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "[%s] prepared %d parameter-independent color frame(s) in %.2fs; "
+            "released_raw=%s",
+            context.run,
+            len(prepared),
+            elapsed,
+            release_images,
+        )
+
+    if requested == "cuda" and context._cuda_evaluator is None:
+        try:
+            context._cuda_evaluator = _CudaIntegratedEvaluator(context)
+        except Exception:
+            try:
+                import cupy as cp
+
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            raise
+        context._prepared_colors.clear()
+        gc.collect()
+    context._evaluation_backend = requested
+    return context
+
+
 def _mass_result_for_evaluation(
     context: CalibrationContext,
     image: Any,
     image_index: int,
     params: Dict[str, Any],
 ) -> Any:
-    result = context.calibration(image)
+    if image_index < len(getattr(context, "_prepared_colors", [])):
+        color_interpretation = context._prepared_colors[image_index]
+        pH = context.calibration.call_pH_analysis(color_interpretation)
+        result = context.calibration.call_flash_and_mass_analysis(pH)
+    else:
+        result = context.calibration(image)
     mode = _normalise_phase_separation(
         getattr(context, "phase_separation", "shared-signal")
     )
@@ -2052,20 +2387,36 @@ def evaluate_run(context: CalibrationContext, params: Dict[str, Any]) -> EvalRes
     feasible = True
     metrics: Dict[str, Metrics] = {}
     samples: List[Tuple[float, float, float]] = []  # (t_hours, injected, detected)
+    cuda_masses: Optional[List[Tuple[float, float, float]]] = None
+    cuda_evaluator = getattr(context, "_cuda_evaluator", None)
+    if cuda_evaluator is not None:
+        try:
+            cuda_masses = cuda_evaluator.evaluate(params)
+        except Exception as exc:  # noqa: BLE001
+            return EvalResult(
+                objective=PENALTY_VALUE,
+                feasible=False,
+                metrics={},
+                status=f"cuda-eval-error:{exc}",
+                params=params,
+            )
     for i, (img, injected, t_h) in enumerate(context._loaded):
         try:
-            mass_result = _mass_result_for_evaluation(context, img, i, params)
-            detected = float(context.geometry.integrate(mass_result.mass))
-            detected_g = (
-                float(context.geometry.integrate(mass_result.mass_g))
-                if getattr(mass_result, "mass_g", None) is not None
-                else None
-            )
-            detected_aq = (
-                float(context.geometry.integrate(mass_result.mass_aq))
-                if getattr(mass_result, "mass_aq", None) is not None
-                else None
-            )
+            if cuda_masses is not None:
+                detected, detected_g, detected_aq = cuda_masses[i]
+            else:
+                mass_result = _mass_result_for_evaluation(context, img, i, params)
+                detected = float(context.geometry.integrate(mass_result.mass))
+                detected_g = (
+                    float(context.geometry.integrate(mass_result.mass_g))
+                    if getattr(mass_result, "mass_g", None) is not None
+                    else None
+                )
+                detected_aq = (
+                    float(context.geometry.integrate(mass_result.mass_aq))
+                    if getattr(mass_result, "mass_aq", None) is not None
+                    else None
+                )
         except Exception as exc:  # noqa: BLE001
             # One-shot full traceback to stdout so the EXACT file:line of a shape/broadcast
             # mismatch is visible (the status string only carries the message). Also dumps
@@ -2223,13 +2574,18 @@ def _diagnose_baseline(context) -> None:
     for i, (img, injected, t_h) in enumerate(context._loaded):
         det = float("nan"); nan_frac = -1.0
         try:
-            mass = context.calibration(img).mass
+            mass = _mass_result_for_evaluation(context, img, i, {}).mass
             arr = np.asarray(getattr(mass, "img", mass), dtype=float)
             nan_frac = float(np.mean(~np.isfinite(arr))) if arr.size else -1.0
             det = float(context.geometry.integrate(mass))
         except Exception as exc:  # noqa: BLE001
             logger.info("[diag %s] img%d ERROR %s", context.run, i, exc); continue
-        date = getattr(img, "date", None)
+        source = (
+            context._prepared_colors[i]
+            if i < len(getattr(context, "_prepared_colors", []))
+            else img
+        )
+        date = getattr(source, "date", None)
         logger.info("[diag %s] img%d date=%s injected=%s detected=%s mass_nan_frac=%.3f",
                     context.run, i, date, injected, det, nan_frac)
 
