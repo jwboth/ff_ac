@@ -27,7 +27,8 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $seedParams = "Z:\Albus\Autokalibrering_log\phase_screen_20260727\phase_screen_seed_params.json"
-$expectedDepthSha = "375be487d0bb598964404432a386316a82496afbc3477aaa3fcf7b81c98fcd21"
+$expectedCachedDepthSha = "375be487d0bb598964404432a386316a82496afbc3477aaa3fcf7b81c98fcd21"
+$expectedRuntimeDepthSha = "009365a492c1f2a0a6c61eabb90e18068985f17b833098e59d0100312db8b1be"
 $processLogDir = Join-Path $repoRoot "logs\phase_sharedpath_l1_gpu"
 
 if ($Runs.Count -eq 0) {
@@ -117,7 +118,7 @@ $env:FFAC_COLOR_PATH_ANCHOR_WEIGHT = "0.75"
 $env:FFAC_COLOR_PATH_ANCHOR_STRICT = "on"
 $env:FFAC_MASTER_LIGHT_CONTEXT = "on"
 $env:FFAC_REQUIRE_VARYING_DEPTH = "on"
-$env:FFAC_EXPECTED_DEPTH_SHA256 = $expectedDepthSha
+$env:FFAC_EXPECTED_DEPTH_SHA256 = $expectedRuntimeDepthSha
 Remove-Item Env:\FFAC_STATIC_LIGHT_CORRECTION -ErrorAction SilentlyContinue
 Remove-Item Env:\FFAC_COUPLE_AQ_GAS -ErrorAction SilentlyContinue
 Remove-Item Env:\FFAC_SIGNAL_PARAMETERIZATION -ErrorAction SilentlyContinue
@@ -196,7 +197,8 @@ foreach ($runValue in $Runs) {
         optuna_dir = $optunaDir
         stdout = $stdout
         stderr = $stderr
-        depth_sha256 = $expectedDepthSha
+        cached_depth_sha256 = $expectedCachedDepthSha
+        runtime_depth_sha256 = $expectedRuntimeDepthSha
     }
     Start-Sleep -Seconds 2
     if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {

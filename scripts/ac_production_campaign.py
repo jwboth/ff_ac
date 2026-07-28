@@ -124,8 +124,8 @@ PHASE_SCREEN_VARIANTS = [
     "phase_residualgas_balanced",
 ]
 PHASE_DECIDER_VARIANTS = ["phase_sharedpath_l1"]
-EXPECTED_DEPTH_SHA256 = (
-    "375be487d0bb598964404432a386316a82496afbc3477aaa3fcf7b81c98fcd21"
+EXPECTED_RUNTIME_DEPTH_SHA256 = (
+    "009365a492c1f2a0a6c61eabb90e18068985f17b833098e59d0100312db8b1be"
 )
 
 FINAL_EXCLUDED_RUNS = {
@@ -636,7 +636,8 @@ def _validate_final_campaign(
 def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
     lines = [
         "$env:FFAC_REQUIRE_VARYING_DEPTH = 'on'",
-        f"$env:FFAC_EXPECTED_DEPTH_SHA256 = '{EXPECTED_DEPTH_SHA256}'",
+        "$env:FFAC_EXPECTED_DEPTH_SHA256 = "
+        f"'{EXPECTED_RUNTIME_DEPTH_SHA256}'",
         "$env:FFAC_TITRATION_FLASH = 'on'"
         if variant.titration
         else "Remove-Item Env:\\FFAC_TITRATION_FLASH -ErrorAction SilentlyContinue",
@@ -844,7 +845,7 @@ def commands(args: argparse.Namespace) -> None:
 def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, spatial_sigma: float) -> dict[str, str]:
     env = dict(base_env)
     env["FFAC_REQUIRE_VARYING_DEPTH"] = "on"
-    env["FFAC_EXPECTED_DEPTH_SHA256"] = EXPECTED_DEPTH_SHA256
+    env["FFAC_EXPECTED_DEPTH_SHA256"] = EXPECTED_RUNTIME_DEPTH_SHA256
     if variant.titration:
         env["FFAC_TITRATION_FLASH"] = "on"
     else:
