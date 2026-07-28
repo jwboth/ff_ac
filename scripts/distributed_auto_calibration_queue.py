@@ -72,6 +72,7 @@ from auto_calibrate_color_to_mass import (  # noqa: E402
     PENALTY_VALUE,
     build_context,
     compute_auto_label_weights,
+    depth_map_identity,
     apply_label_weight_grouping,
     evaluate_run,
     load_bounds_map,
@@ -229,22 +230,32 @@ def _collect_worker_provenance(hostname: Optional[str] = None) -> Dict[str, Any]
 
 def _context_model_identity(context: Any) -> Dict[str, Any]:
     flash = getattr(getattr(context, "calibration", None), "flash", None)
-    if flash is None:
-        return {"flash_class": None}
     identity: Dict[str, Any] = {
-        "flash_class": f"{type(flash).__module__}.{type(flash).__qualname__}",
+        "flash_class": (
+            f"{type(flash).__module__}.{type(flash).__qualname__}"
+            if flash is not None
+            else None
+        ),
     }
-    titration_params = getattr(flash, "titration_params", None)
+    titration_params = getattr(flash, "titration_params", None) if flash else None
     if isinstance(titration_params, dict):
         identity["titration_params"] = {
             str(key): float(value) for key, value in titration_params.items()
         }
-    if hasattr(flash, "n_lut"):
+    if flash is not None and hasattr(flash, "n_lut"):
         identity["n_lut"] = int(flash.n_lut)
     identity["signal_parameterization"] = getattr(
         context, "signal_parameterization", None
     )
     identity["phase_separation"] = getattr(context, "phase_separation", None)
+    geometry = getattr(context, "geometry", None)
+    depth_identity = getattr(geometry, "_ffac_depth_identity", None)
+    if depth_identity is None and geometry is not None:
+        try:
+            depth_identity = depth_map_identity(geometry)
+        except Exception:
+            depth_identity = None
+    identity["depth_map"] = depth_identity
     return identity
 
 
@@ -2315,6 +2326,12 @@ def master_main(args: argparse.Namespace) -> None:
         "color_path_anchor": os.environ.get("FFAC_COLOR_PATH_ANCHOR", ""),
         "color_path_anchor_weight": os.environ.get(
             "FFAC_COLOR_PATH_ANCHOR_WEIGHT", ""
+        ),
+        "require_varying_depth": os.environ.get(
+            "FFAC_REQUIRE_VARYING_DEPTH", ""
+        ),
+        "expected_depth_sha256": os.environ.get(
+            "FFAC_EXPECTED_DEPTH_SHA256", ""
         ),
     }
 

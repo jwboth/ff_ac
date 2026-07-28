@@ -123,6 +123,10 @@ PHASE_SCREEN_VARIANTS = [
     "phase_sharedpath_balanced",
     "phase_residualgas_balanced",
 ]
+PHASE_DECIDER_VARIANTS = ["phase_sharedpath_l1"]
+EXPECTED_DEPTH_SHA256 = (
+    "375be487d0bb598964404432a386316a82496afbc3477aaa3fcf7b81c98fcd21"
+)
 
 FINAL_EXCLUDED_RUNS = {
     "ac29": "physical/chemical outlier with low-pH yellow initial state",
@@ -365,6 +369,20 @@ VARIANTS = [
         ),
     ),
     Variant(
+        "phase_sharedpath_l1",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        optuna_seed=17,
+        note=(
+            "AC60-regularized relative color-path shape with equal point-wise L1; "
+            "isolates color-path transfer from operational-window weighting"
+        ),
+    ),
+    Variant(
         "phase_residualgas_balanced",
         "window-balanced",
         "off",
@@ -469,6 +487,9 @@ VARIANT_SETS = {
     "phase_screen": [
         *PHASE_SCREEN_VARIANTS,
     ],
+    "phase_decider": [
+        *PHASE_DECIDER_VARIANTS,
+    ],
     "all": [variant.name for variant in VARIANTS],
 }
 
@@ -521,6 +542,8 @@ def _select_runs(run_set: str) -> list[str]:
         return FINAL_PRODUCTION_RUNS
     if run_set == "phase_screen":
         return PHASE_SCREEN_RUNS
+    if run_set == "phase_decider":
+        return PHASE_SCREEN_RUNS
     if run_set == "all":
         return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
     runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
@@ -535,6 +558,25 @@ def _validate_final_campaign(
     runs: list[str],
 ) -> None:
     selected_names = [variant.name for variant in selected]
+    if any(name in PHASE_DECIDER_VARIANTS for name in selected_names):
+        if selected_names != PHASE_DECIDER_VARIANTS or runs != PHASE_SCREEN_RUNS:
+            raise SystemExit(
+                "The phase decider requires --variant phase_decider "
+                "--run-set phase_decider."
+            )
+        if int(args.max_iters) != 800 or int(args.warmup_iters) != 150:
+            raise SystemExit(
+                "The phase decider requires --max-iters 800 --warmup-iters 150."
+            )
+        if int(args.max_in_flight_per_run) != 1:
+            raise SystemExit(
+                "The phase decider requires --max-in-flight-per-run 1."
+            )
+        if not args.seed_params_file or not Path(args.seed_params_file).exists():
+            raise SystemExit(
+                "The phase decider requires the phase-screen seed-parameter file."
+            )
+        return
     if any(name in PHASE_SCREEN_VARIANTS for name in selected_names):
         if selected_names != PHASE_SCREEN_VARIANTS or runs != PHASE_SCREEN_RUNS:
             raise SystemExit(
@@ -593,6 +635,8 @@ def _validate_final_campaign(
 
 def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
     lines = [
+        "$env:FFAC_REQUIRE_VARYING_DEPTH = 'on'",
+        f"$env:FFAC_EXPECTED_DEPTH_SHA256 = '{EXPECTED_DEPTH_SHA256}'",
         "$env:FFAC_TITRATION_FLASH = 'on'"
         if variant.titration
         else "Remove-Item Env:\\FFAC_TITRATION_FLASH -ErrorAction SilentlyContinue",
@@ -799,6 +843,8 @@ def commands(args: argparse.Namespace) -> None:
 
 def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, spatial_sigma: float) -> dict[str, str]:
     env = dict(base_env)
+    env["FFAC_REQUIRE_VARYING_DEPTH"] = "on"
+    env["FFAC_EXPECTED_DEPTH_SHA256"] = EXPECTED_DEPTH_SHA256
     if variant.titration:
         env["FFAC_TITRATION_FLASH"] = "on"
     else:
@@ -994,7 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="holiday4",
         help=(
             "Variant name, comma-list, final_production, reduced_model, "
-            "final_geometry, phase_screen, screen_step1, holiday4, holiday5, "
+            "final_geometry, phase_screen, phase_decider, screen_step1, holiday4, holiday5, "
             "spatial, global, or all."
         ),
     )
@@ -1003,7 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help=(
             "production, rollout, final_production, reduced_model, final_geometry, "
-            "phase_screen, screen_step1, all, or an explicit space/comma-separated run list."
+            "phase_screen, phase_decider, screen_step1, all, or an explicit space/comma-separated run list."
         ),
     )
     cmd.add_argument("--repo", default=".")
@@ -1048,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="hardcase8",
         help=(
             "Variant name, comma-list, final_production, reduced_model, "
-            "final_geometry, phase_screen, screen_step1, hardcase8, holiday4, holiday5, "
+            "final_geometry, phase_screen, phase_decider, screen_step1, hardcase8, holiday4, holiday5, "
             "spatial, global, or all."
         ),
     )
@@ -1057,7 +1103,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="hardcases",
         help=(
             "production, rollout, hardcases, final_production, reduced_model, "
-            "final_geometry, phase_screen, screen_step1, all, or an explicit "
+            "final_geometry, phase_screen, phase_decider, screen_step1, all, or an explicit "
             "space/comma-separated run list."
         ),
     )

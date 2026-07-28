@@ -58,6 +58,8 @@ MANAGED_ENV = {
     "FFAC_COLOR_PATH_ANCHOR_STRICT",
     "FFAC_PHASE_SEPARATION",
     "FFAC_MASTER_LIGHT_CONTEXT",
+    "FFAC_REQUIRE_VARYING_DEPTH",
+    "FFAC_EXPECTED_DEPTH_SHA256",
 }
 
 
@@ -128,9 +130,14 @@ def _write_phase_previews(
     return outputs
 
 
-def evaluate_holdouts(log_root: Path, runs: list[str]) -> Path:
+def evaluate_holdouts(
+    log_root: Path,
+    runs: list[str],
+    variant_spec: str = "phase_screen",
+) -> Path:
     rows: list[dict] = []
-    for variant in _select_variants("phase_screen"):
+    variants = _select_variants(variant_spec)
+    for variant in variants:
         variant_root = log_root / variant.name
         with _variant_environment(variant):
             for run in runs:
@@ -188,7 +195,12 @@ def evaluate_holdouts(log_root: Path, runs: list[str]) -> Path:
                     f"{rows[-1]['holdout_mae']:.6g}",
                     flush=True,
                 )
-    output = log_root / "phase_screen_holdout_summary.json"
+    output_name = (
+        "phase_screen_holdout_summary.json"
+        if variant_spec == "phase_screen"
+        else f"holdout_summary_{variant_spec.replace(',', '_')}.json"
+    )
+    output = log_root / output_name
     output.write_text(json.dumps({"rows": rows}, indent=2), encoding="utf-8")
     return output
 
@@ -197,10 +209,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--logs-root", type=Path, default=DEFAULT_LOG_ROOT)
     parser.add_argument("--runs", nargs="+", default=PHASE_SCREEN_RUNS)
+    parser.add_argument(
+        "--variant",
+        default="phase_screen",
+        help="Campaign variant or variant set to evaluate.",
+    )
     args = parser.parse_args()
     output = evaluate_holdouts(
         args.logs_root,
         [str(run).lower() for run in args.runs],
+        args.variant,
     )
     print(f"Holdout summary: {output}")
 

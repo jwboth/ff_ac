@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import socket
 import time
@@ -12,6 +13,7 @@ import pytest
 
 from scripts import auto_calibrate_color_to_mass
 from scripts.ac_production_campaign import (
+    PHASE_DECIDER_VARIANTS,
     PHASE_SCREEN_RUNS,
     _env_lines,
     _select_runs,
@@ -25,6 +27,7 @@ from scripts.auto_calibrate_color_to_mass import (
     _normalise_evaluation_backend,
     _normalise_phase_separation,
     _regularize_color_paths,
+    depth_map_identity,
     evaluate_run,
     prepare_evaluation_context,
 )
@@ -44,6 +47,7 @@ from scripts.distributed_auto_calibration_queue import (
 )
 from scripts.ffac_titration_flash import TitrationFlash
 from scripts.opencl_integrated_evaluator import OpenCLIntegratedEvaluator
+from scripts.verify_ac_depth_maps import verify_depth_maps
 
 
 class _ArrayImage:
@@ -159,12 +163,17 @@ def test_result_provenance_summary_and_model_identity():
     )
     context = SimpleNamespace(
         calibration=SimpleNamespace(flash=flash),
+        geometry=SimpleNamespace(
+            depth=_ArrayImage([[0.010, 0.015]]),
+        ),
         signal_parameterization="per-label",
         phase_separation="shared-signal",
     )
     model = _context_model_identity(context)
     assert model["flash_class"] == "scripts.ffac_titration_flash.TitrationFlash"
     assert model["titration_params"]["co2_sat_M"] == pytest.approx(0.034)
+    assert model["depth_map"]["varying"] is True
+    assert model["depth_map"]["minimum_m"] == pytest.approx(0.010)
 
     summary = _result_provenance_summary(
         {
@@ -645,6 +654,92 @@ def test_phase_screen_is_paired_and_physically_stepwise(tmp_path):
         ]
     )
     _validate_final_campaign(args, variants, PHASE_SCREEN_RUNS)
+
+
+def test_phase_decider_is_shared_path_with_pointwise_l1(tmp_path):
+    variants = _select_variants("phase_decider")
+
+    assert [variant.name for variant in variants] == PHASE_DECIDER_VARIANTS
+    assert _select_runs("phase_decider") == PHASE_SCREEN_RUNS
+    assert len(variants) == 1
+    variant = variants[0]
+    assert variant.objective_integral == "off"
+    assert variant.color_path_anchor == "ac60"
+    assert variant.phase_separation == "shared-signal"
+    assert variant.optuna_seed == 17
+    assert variant.template_registration == "ac14_template"
+    decider_env = _env_lines(variant, 6.0)
+    assert "$env:FFAC_REQUIRE_VARYING_DEPTH = 'on'" in decider_env
+    assert any("FFAC_EXPECTED_DEPTH_SHA256" in line for line in decider_env)
+
+    seeds = tmp_path / "seeds.json"
+    seeds.write_text("{}", encoding="utf-8")
+    args = build_campaign_parser().parse_args(
+        [
+            "launch",
+            "--variant",
+            "phase_decider",
+            "--run-set",
+            "phase_decider",
+            "--max-iters",
+            "800",
+            "--warmup-iters",
+            "150",
+            "--max-active-runs",
+            "6",
+            "--max-in-flight-per-run",
+            "1",
+            "--seed-params-file",
+            str(seeds),
+        ]
+    )
+    _validate_final_campaign(args, variants, PHASE_SCREEN_RUNS)
+
+
+def test_depth_map_identity_distinguishes_varying_from_constant():
+    varying = depth_map_identity(
+        SimpleNamespace(depth=_ArrayImage([[0.010, 0.015]]))
+    )
+    constant = depth_map_identity(SimpleNamespace(depth=0.012))
+
+    assert varying["varying"] is True
+    assert varying["std_m"] > 0.0
+    assert constant["varying"] is False
+    assert constant["shape"] == []
+
+
+def test_depth_map_preflight_rejects_wrong_cached_map(tmp_path):
+    measurements = tmp_path / "depth_measurements.csv"
+    measurements.write_text("x,y,depth\n0,0,0.01\n", encoding="ascii")
+    measurement_sha = hashlib.sha256(measurements.read_bytes()).hexdigest()
+    results = tmp_path / "results"
+    depth_dir = results / "ac20" / "setup" / "depth"
+    depth_dir.mkdir(parents=True)
+    expected = np.array([[0.010, 0.015]], dtype=np.float64)
+    np.savez(depth_dir / "depth_map.npz", array=expected)
+    expected_sha = hashlib.sha256(expected.tobytes()).hexdigest()
+
+    report = verify_depth_maps(
+        ["ac20"],
+        results_root=results,
+        measurements_path=measurements,
+        expected_measurements_sha256=measurement_sha,
+        expected_depth_sha256=expected_sha,
+    )
+    assert report["runs"][0]["std_m"] > 0.0
+
+    np.savez(
+        depth_dir / "depth_map.npz",
+        array=np.full((1, 2), 0.012, dtype=np.float64),
+    )
+    with pytest.raises(RuntimeError, match="SHA mismatch"):
+        verify_depth_maps(
+            ["ac20"],
+            results_root=results,
+            measurements_path=measurements,
+            expected_measurements_sha256=measurement_sha,
+            expected_depth_sha256=expected_sha,
+        )
 
 
 def test_residual_gas_warmup_includes_a_targeted_threshold_grid():

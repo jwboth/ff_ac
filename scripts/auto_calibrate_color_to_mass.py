@@ -17,6 +17,7 @@ import argparse
 import random
 import copy
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -67,6 +68,64 @@ _SIGNAL_GAIN_RE = re.compile(r"^signal\.label(?P<label>-?\d+)\.gain$")
 _VALUE_RE = re.compile(r"(?:.*\.)?value(\d+)$", re.IGNORECASE)
 _SHARED_SIGNAL_LABEL = -1
 _RESIDUAL_GAS_SCORE_CLIP = 2.0
+
+
+def depth_map_identity(geometry: Any) -> Dict[str, Any]:
+    """Return a stable identity for the depth field used by the geometry."""
+
+    depth = getattr(geometry, "depth", None)
+    values = getattr(depth, "img", depth)
+    array = np.asarray(values)
+    if array.ndim == 0:
+        finite = np.asarray([float(array)], dtype=np.float64)
+        digest_array = finite
+    else:
+        finite = np.asarray(array[np.isfinite(array)], dtype=np.float64)
+        digest_array = np.ascontiguousarray(array)
+    if finite.size == 0:
+        raise RuntimeError("Geometry depth contains no finite values.")
+    return {
+        "shape": list(array.shape),
+        "sha256": hashlib.sha256(digest_array.tobytes()).hexdigest(),
+        "minimum_m": float(np.min(finite)),
+        "maximum_m": float(np.max(finite)),
+        "mean_m": float(np.mean(finite)),
+        "std_m": float(np.std(finite)),
+        "varying": bool(array.ndim > 0 and np.ptp(finite) > 1e-6),
+    }
+
+
+def validate_depth_map(geometry: Any, run: str) -> Dict[str, Any]:
+    """Validate and cache the depth identity requested by the campaign."""
+
+    identity = depth_map_identity(geometry)
+    require_varying = os.environ.get(
+        "FFAC_REQUIRE_VARYING_DEPTH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    expected_sha = os.environ.get(
+        "FFAC_EXPECTED_DEPTH_SHA256", ""
+    ).strip().lower()
+    if require_varying and not identity["varying"]:
+        raise RuntimeError(
+            f"[{run}] varying depth map required, but geometry depth is constant: "
+            f"{identity}"
+        )
+    if expected_sha and identity["sha256"].lower() != expected_sha:
+        raise RuntimeError(
+            f"[{run}] depth map SHA mismatch: {identity['sha256']} != "
+            f"{expected_sha}"
+        )
+    setattr(geometry, "_ffac_depth_identity", identity)
+    logger.info(
+        "[%s] depth map shape=%s range=%.6f..%.6f m std=%.6f m sha256=%s",
+        run,
+        identity["shape"],
+        identity["minimum_m"],
+        identity["maximum_m"],
+        identity["std_m"],
+        identity["sha256"],
+    )
+    return identity
 
 
 # =========================================================================
@@ -1472,6 +1531,7 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
     experiment = ctx_raw.experiment
     geometry = getattr(fluidflower, "geometry", None)
     config = getattr(ctx_raw, "config", None)
+    validate_depth_map(geometry, run)
 
     # Sanitise the geometry integration weights: the porosity map carries NaN
     # OUTSIDE the sand domain (~26%% of pixels), and geometry.integrate weights by
