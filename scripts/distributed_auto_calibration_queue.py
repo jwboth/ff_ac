@@ -2806,6 +2806,11 @@ def worker_loop(args: argparse.Namespace) -> None:
         )
     else:
         worker_evaluation_backend = requested_backend
+    cuda_has_cpu_peer = (
+        requested_backend == "auto"
+        and worker_evaluation_backend == "cuda"
+        and cuda_workers < max(1, int(getattr(args, "workers", 1) or 1))
+    )
     poll = max(0.5, args.poll_seconds)
     proc = psutil.Process(os.getpid()) if psutil else None
     stickiness_wait = max(0.0, float(getattr(args, "stickiness_wait_seconds", 0.0) or 0.0))
@@ -2990,7 +2995,7 @@ def worker_loop(args: argparse.Namespace) -> None:
                     dirs,
                     worker_id,
                     preferred_run=preferred_run,
-                    allow_sanity=not sanity_lock_active,
+                    allow_sanity=not sanity_lock_active and not cuda_has_cpu_peer,
                 )
                 if not task_path:
                     break
