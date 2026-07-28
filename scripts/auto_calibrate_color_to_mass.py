@@ -32,6 +32,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+try:
+    from scripts.ffac_titration_flash import TitrationFlash
+except ModuleNotFoundError:
+    from ffac_titration_flash import TitrationFlash
+
 logger = logging.getLogger(__name__)
 
 PENALTY_VALUE = 1e12
@@ -1519,7 +1524,6 @@ def build_context(run, config_dir, rig_cls, ref_config_path=None, use_facies=Tru
         pass
     if _titr_on:
         try:
-            from darsia.multiphase.flash import TitrationFlash
             _flash = getattr(cta, "flash", None)
             if _flash is not None and not isinstance(_flash, TitrationFlash):
                 _kw = {}

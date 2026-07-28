@@ -26,10 +26,13 @@ from scripts.auto_calibrate_color_to_mass import (
     prepare_evaluation_context,
 )
 from scripts.distributed_auto_calibration_queue import (
+    _context_model_identity,
     _generate_warmup_params,
+    _result_provenance_summary,
     _select_pending_task,
     _task_payload,
 )
+from scripts.ffac_titration_flash import TitrationFlash
 
 
 class _ArrayImage:
@@ -107,6 +110,71 @@ def test_evaluation_backend_aliases_and_validation():
     assert _normalise_evaluation_backend("cuda") == "cuda"
     with pytest.raises(ValueError, match="Unknown evaluation backend"):
         _normalise_evaluation_backend("invalid")
+
+
+def test_ffac_titration_flash_matches_local_darsia_reference():
+    base = darsia.SimpleFlash(
+        min_value_aq=0.0,
+        max_value_aq=1.05,
+        min_value_g=0.75,
+        max_value_g=1.95,
+    )
+    portable = TitrationFlash.from_simple(base)
+
+    assert portable._lut_y[0] == pytest.approx(0.0)
+    assert portable._lut_y[-1] == pytest.approx(1.0)
+    assert portable._lut_caq[0] == pytest.approx(0.0)
+    assert portable._lut_caq[-1] == pytest.approx(1.0)
+    assert np.all(np.diff(portable._lut_y) > 0.0)
+    restored = TitrationFlash.from_dict(portable.to_dict())
+    np.testing.assert_allclose(restored._lut_y, portable._lut_y)
+    np.testing.assert_allclose(restored._lut_caq, portable._lut_caq)
+
+    reference_class = getattr(darsia, "TitrationFlash", None)
+    if reference_class is not None:
+        reference = reference_class.from_simple(base)
+        np.testing.assert_allclose(portable._lut_y, reference._lut_y)
+        np.testing.assert_allclose(portable._lut_caq, reference._lut_caq)
+
+
+def test_result_provenance_summary_and_model_identity():
+    flash = TitrationFlash(
+        min_value_aq=0.0,
+        max_value_aq=1.05,
+        min_value_g=0.75,
+        max_value_g=1.95,
+    )
+    context = SimpleNamespace(
+        calibration=SimpleNamespace(flash=flash),
+        signal_parameterization="per-label",
+        phase_separation="shared-signal",
+    )
+    model = _context_model_identity(context)
+    assert model["flash_class"] == "scripts.ffac_titration_flash.TitrationFlash"
+    assert model["titration_params"]["co2_sat_M"] == pytest.approx(0.034)
+
+    summary = _result_provenance_summary(
+        {
+            "worker_id": "Olav_2",
+            "hostname": "Olav",
+            "evaluation_backend": "prepared",
+            "model_identity": model,
+            "provenance": {
+                "source_fingerprint": "abc123",
+                "ff_ac": {"commit": "ffac-sha", "dirty": False},
+                "darsia": {
+                    "commit": "darsia-sha",
+                    "dirty": True,
+                    "diff_sha256": "diff-sha",
+                },
+            },
+        }
+    )
+    assert summary["worker_id"] == "Olav_2"
+    assert summary["hostname"] == "Olav"
+    assert summary["source_fingerprint"] == "abc123"
+    assert summary["ff_ac_commit"] == "ffac-sha"
+    assert summary["darsia_dirty"] is True
 
 
 def test_cpu_task_selection_prioritizes_sanity_over_preferred_run(tmp_path):

@@ -125,7 +125,7 @@ for ($index = 0; $index -lt $queues.Count; $index++) {
         "--control-dir", $controlDir,
         "--workers", [string]$workersPerQueue,
         "--worker-stall-seconds", "600",
-        "--idle-exit-seconds", "120",
+        "--idle-exit-seconds", "900",
         "--stickiness-wait-seconds", "20",
         "--stagger-seconds", "10",
         "--threads-per-worker", "1",

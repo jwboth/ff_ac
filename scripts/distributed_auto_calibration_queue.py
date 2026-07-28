@@ -27,11 +27,15 @@ import ast
 import copy
 import gc
 import hashlib
+import importlib
+import importlib.metadata
+import inspect
 import json
 import math
 import os
 import random
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -111,6 +115,145 @@ def _hostname() -> str:
         return socket.gethostname()
     except Exception:
         return "unknown-host"
+
+
+def _git_provenance(root: Path) -> Dict[str, Any]:
+    """Return a compact, content-sensitive identity for a local git checkout."""
+
+    result: Dict[str, Any] = {
+        "root": str(root),
+        "commit": None,
+        "dirty": None,
+        "diff_sha256": None,
+    }
+    if not root.exists():
+        return result
+
+    def _git(*args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+        return completed.stdout if completed.returncode == 0 else b""
+
+    try:
+        commit = _git("rev-parse", "HEAD").decode("ascii", errors="replace").strip()
+        status = _git("status", "--porcelain", "--untracked-files=no")
+        diff = _git("diff", "--binary", "HEAD", "--", ".")
+        result.update(
+            {
+                "commit": commit or None,
+                "dirty": bool(status.strip()),
+                "diff_sha256": hashlib.sha256(diff).hexdigest(),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _source_file_fingerprint(paths: Sequence[Path]) -> Tuple[str, Dict[str, str]]:
+    hashes: Dict[str, str] = {}
+    repo_root = SCRIPT_DIR.parent.resolve()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+            try:
+                key = resolved.relative_to(repo_root).as_posix()
+            except ValueError:
+                key = resolved.name
+            hashes[key] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except Exception:
+            continue
+    encoded = json.dumps(hashes, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), hashes
+
+
+def _collect_worker_provenance(hostname: Optional[str] = None) -> Dict[str, Any]:
+    """Collect versions and source fingerprints once when a worker starts."""
+
+    repo_root = SCRIPT_DIR.parent
+    darsia_root = repo_root / "external" / "darsia"
+    source_paths = [
+        Path(__file__),
+        SCRIPT_DIR / "auto_calibrate_color_to_mass.py",
+        SCRIPT_DIR / "ffac_titration_flash.py",
+    ]
+    try:
+        for module_name in (
+            "darsia.multiphase.flash",
+            "darsia.corrections.color.colorcorrection",
+            "darsia.signals.models.color_path_interpolation",
+        ):
+            module = importlib.import_module(module_name)
+            source = inspect.getsourcefile(module)
+            if source:
+                source_paths.append(Path(source))
+    except Exception:
+        pass
+    source_fingerprint, source_files = _source_file_fingerprint(source_paths)
+    packages: Dict[str, Optional[str]] = {}
+    for package in ("numpy", "scipy", "optuna", "cupy-cuda13x"):
+        try:
+            packages[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            packages[package] = None
+    return {
+        "schema": 1,
+        "hostname": hostname or _hostname(),
+        "created_at": _now(),
+        "ff_ac": _git_provenance(repo_root),
+        "darsia": _git_provenance(darsia_root),
+        "source_fingerprint": source_fingerprint,
+        "source_files": source_files,
+        "python": sys.version,
+        "packages": packages,
+    }
+
+
+def _context_model_identity(context: Any) -> Dict[str, Any]:
+    flash = getattr(getattr(context, "calibration", None), "flash", None)
+    if flash is None:
+        return {"flash_class": None}
+    identity: Dict[str, Any] = {
+        "flash_class": f"{type(flash).__module__}.{type(flash).__qualname__}",
+    }
+    titration_params = getattr(flash, "titration_params", None)
+    if isinstance(titration_params, dict):
+        identity["titration_params"] = {
+            str(key): float(value) for key, value in titration_params.items()
+        }
+    if hasattr(flash, "n_lut"):
+        identity["n_lut"] = int(flash.n_lut)
+    identity["signal_parameterization"] = getattr(
+        context, "signal_parameterization", None
+    )
+    identity["phase_separation"] = getattr(context, "phase_separation", None)
+    return identity
+
+
+def _result_provenance_summary(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    provenance = payload.get("provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+    ff_ac = provenance.get("ff_ac")
+    ff_ac = ff_ac if isinstance(ff_ac, dict) else {}
+    darsia = provenance.get("darsia")
+    darsia = darsia if isinstance(darsia, dict) else {}
+    return {
+        "worker_id": payload.get("worker_id"),
+        "hostname": payload.get("hostname"),
+        "evaluation_backend": payload.get("evaluation_backend"),
+        "model_identity": payload.get("model_identity"),
+        "source_fingerprint": provenance.get("source_fingerprint"),
+        "ff_ac_commit": ff_ac.get("commit"),
+        "ff_ac_dirty": ff_ac.get("dirty"),
+        "darsia_commit": darsia.get("commit"),
+        "darsia_dirty": darsia.get("dirty"),
+        "darsia_diff_sha256": darsia.get("diff_sha256"),
+    }
 
 
 class _Tee:
@@ -2122,6 +2265,7 @@ def master_main(args: argparse.Namespace) -> None:
         row_settings = dict(master_settings)
         if state.label_weights:
             row_settings["label_weights"] = state.label_weights
+        row_settings["task_provenance"] = _result_provenance_summary(payload)
         row = {
             "iter": payload.get("seq", info.seq),
             "objective": payload.get("objective", PENALTY_VALUE),
@@ -2248,6 +2392,7 @@ def master_main(args: argparse.Namespace) -> None:
         label_weights_payload = payload.get("label_weights")
         if isinstance(label_weights_payload, dict) and label_weights_payload:
             row_settings["label_weights"] = label_weights_payload
+        row_settings["task_provenance"] = _result_provenance_summary(payload)
         row = {
             "iter": payload.get("seq", 0),
             "objective": payload.get("objective", PENALTY_VALUE),
@@ -2836,10 +2981,23 @@ def worker_loop(args: argparse.Namespace) -> None:
     log_file = log_path.open("a", encoding="utf-8", buffering=1)
     sys.stdout = _Tee(sys.stdout, log_file)
     sys.stderr = _Tee(sys.stderr, log_file)
+    worker_provenance = _collect_worker_provenance(worker_hostname)
+    worker_manifest = {
+        **worker_provenance,
+        "worker_id": worker_id,
+        "evaluation_backend": worker_evaluation_backend,
+    }
+    _safe_write_json(
+        log_dir / f"{worker_id}.provenance.json",
+        worker_manifest,
+        attempts=5,
+        delay=0.1,
+    )
     thread_note = f" threads={thread_limit}" if thread_limit else ""
     print(
         f"[{worker_id}] started host={worker_hostname}{thread_note} "
-        f"eval_backend={worker_evaluation_backend}"
+        f"eval_backend={worker_evaluation_backend} "
+        f"source={worker_provenance['source_fingerprint'][:12]}"
     )
     memmap_mode = os.getenv("DARSIA_MEMMAP_MODE", "off")
     memmap_dir = os.getenv("DARSIA_MEMMAP_DIR", "")
@@ -2913,6 +3071,16 @@ def worker_loop(args: argparse.Namespace) -> None:
                 "last_seen": now,
                 "pid": os.getpid(),
                 "heartbeat_interval_seconds": heartbeat_interval,
+                "evaluation_backend": worker_evaluation_backend,
+                "source_fingerprint": worker_provenance.get(
+                    "source_fingerprint"
+                ),
+                "ff_ac_commit": worker_provenance.get("ff_ac", {}).get(
+                    "commit"
+                ),
+                "darsia_commit": worker_provenance.get("darsia", {}).get(
+                    "commit"
+                ),
             }
             if started_at is not None:
                 payload["task_started_at"] = started_at
@@ -3118,9 +3286,11 @@ def worker_loop(args: argparse.Namespace) -> None:
 
         max_rss = None
         max_vms = None
+        model_identity: Optional[Dict[str, Any]] = None
         try:
             task_start = _now()
             ctx = _get_context(payload)
+            model_identity = _context_model_identity(ctx)
             from auto_calibrate_color_to_mass import evaluate_run  # noqa: E402
 
             sanity_spec = payload.get("sanity")
@@ -3241,6 +3411,8 @@ def worker_loop(args: argparse.Namespace) -> None:
                     "_cuda_fallback_reason",
                     None,
                 ),
+                "model_identity": model_identity,
+                "provenance": worker_provenance,
                 "max_rss_mb": max_rss,
                 "max_vms_mb": max_vms,
                 "runtime_seconds": _now() - task_start,
@@ -3280,6 +3452,8 @@ def worker_loop(args: argparse.Namespace) -> None:
                 "worker_id": worker_id,
                 "hostname": worker_hostname,
                 "evaluation_backend": worker_evaluation_backend,
+                "model_identity": model_identity,
+                "provenance": worker_provenance,
                 "max_rss_mb": max_rss,
                 "max_vms_mb": max_vms,
                 "runtime_seconds": _now() - task_start if "task_start" in locals() else None,
