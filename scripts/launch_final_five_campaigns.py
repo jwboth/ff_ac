@@ -70,6 +70,7 @@ class GpuLane:
     backend: str
     variant: str
     runs: tuple[str, ...]
+    start_after: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class ProcessSpec:
     stdout: str
     env: dict[str, str]
     restartable: bool = True
+    start_after: str | None = None
 
 
 VARIANTS = (
@@ -197,6 +199,7 @@ def gpu_lanes() -> tuple[GpuLane, ...]:
             "cuda",
             "sharedpath_s73",
             gpu_runs(VARIANT_BY_NAME["sharedpath_s73"]),
+            start_after="cuda_control_s17",
         ),
     )
 
@@ -239,10 +242,14 @@ def validate_plan() -> dict:
             f"Expected 12 CPU workers per host, got {cpu_workers_per_host}"
         )
     host_gpu_counts = {
-        host: sum(1 for lane in gpu_lanes() if lane.host == host)
+        host: sum(
+            1
+            for lane in gpu_lanes()
+            if lane.host == host and lane.start_after is None
+        )
         for host in ("moderskipet", "olav")
     }
-    if host_gpu_counts != {"moderskipet": 4, "olav": 3}:
+    if host_gpu_counts != {"moderskipet": 3, "olav": 3}:
         raise RuntimeError(f"Unexpected GPU lane counts: {host_gpu_counts}")
     return {
         "schema": 1,
@@ -606,6 +613,9 @@ def build_process_specs(
                 command=command,
                 stdout=str(local_root / f"gpu_{lane.name}.log"),
                 env=_variant_env(variant, master=True),
+                start_after=(
+                    f"gpu_{lane.start_after}" if lane.start_after else None
+                ),
             )
         )
     return tuple(specs)
@@ -706,13 +716,20 @@ def launch(args: argparse.Namespace) -> int:
     managed: dict[str, dict] = {}
     role = args.role.lower()
     for spec in specs:
-        process = _spawn(spec)
         managed[spec.name] = {
             "spec": spec,
-            "process": process,
+            "process": None,
             "restarts": 0,
             "last_exit_code": None,
         }
+        if spec.start_after:
+            print(
+                f"DEFER {spec.name} until {spec.start_after} completes",
+                flush=True,
+            )
+            continue
+        process = _spawn(spec)
+        managed[spec.name]["process"] = process
         print(f"START {spec.name} pid={process.pid}", flush=True)
         if spec.kind == "master":
             time.sleep(2)
@@ -733,10 +750,15 @@ def launch(args: argparse.Namespace) -> int:
             {
                 "name": name,
                 "kind": item["spec"].kind,
-                "pid": item["process"].pid,
+                "pid": (
+                    item["process"].pid
+                    if item["process"] is not None
+                    else None
+                ),
                 "queue": item["spec"].queue,
                 "stdout": item["spec"].stdout,
                 "command": list(item["spec"].command),
+                "start_after": item["spec"].start_after,
             }
             for name, item in managed.items()
         ],
@@ -748,7 +770,38 @@ def launch(args: argparse.Namespace) -> int:
         status_rows = []
         for name, item in managed.items():
             spec: ProcessSpec = item["spec"]
-            process: subprocess.Popen = item["process"]
+            process: subprocess.Popen | None = item["process"]
+            if process is None:
+                dependency = managed.get(spec.start_after or "")
+                dependency_complete = bool(
+                    dependency
+                    and _queue_complete(dependency["spec"].queue)
+                )
+                if dependency_complete:
+                    process = _spawn(spec)
+                    item["process"] = process
+                    print(
+                        f"START {name} pid={process.pid} "
+                        f"after={spec.start_after}",
+                        flush=True,
+                    )
+                else:
+                    running += 1
+                    status_rows.append(
+                        {
+                            "name": name,
+                            "kind": spec.kind,
+                            "pid": None,
+                            "running": False,
+                            "pending": True,
+                            "start_after": spec.start_after,
+                            "exit_code": None,
+                            "last_exit_code": item["last_exit_code"],
+                            "restarts": item["restarts"],
+                            "queue_complete": False,
+                        }
+                    )
+                    continue
             exit_code = process.poll()
             if exit_code is not None:
                 item["last_exit_code"] = exit_code
@@ -775,6 +828,8 @@ def launch(args: argparse.Namespace) -> int:
                     "kind": spec.kind,
                     "pid": item["process"].pid,
                     "running": exit_code is None,
+                    "pending": False,
+                    "start_after": spec.start_after,
                     "exit_code": exit_code,
                     "last_exit_code": item["last_exit_code"],
                     "restarts": item["restarts"],

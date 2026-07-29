@@ -30,7 +30,7 @@ def test_final_five_plan_covers_every_run_once_per_variant():
     assert plan["cpu_assignments"] == 24
     assert plan["gpu_assignments"] == 176
     assert plan["cpu_workers_per_host"] == 12
-    assert plan["gpu_workers"] == {"moderskipet": 4, "olav": 3}
+    assert plan["gpu_workers"] == {"moderskipet": 3, "olav": 3}
 
     assignments = {
         (row["variant"], row["run"]) for row in plan["assignments"]
@@ -79,6 +79,10 @@ def test_process_specs_enforce_full_budget_depth_and_sequential_optuna(
     assert sum(spec.kind == "watchdog" for spec in olav) == 5
     assert sum(spec.kind == "gpu" for spec in moderskipet) == 4
     assert sum(spec.kind == "gpu" for spec in olav) == 3
+    deferred = [spec for spec in moderskipet if spec.start_after]
+    assert len(deferred) == 1
+    assert deferred[0].name == "gpu_cuda_sharedpath_s73"
+    assert deferred[0].start_after == "gpu_cuda_control_s17"
 
     all_specs = (*moderskipet, *olav)
     for spec in all_specs:
