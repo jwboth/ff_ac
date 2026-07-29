@@ -12,6 +12,12 @@ baseline = "DSC00001.JPG"
 [data.path.baseline]
 paths = ["DSC00001.JPG"]
 
+# The original AC44 permeability cache became unreadable over SMB on 2026-07-29.
+# This recovered rig cache preserves every AC44 asset and substitutes only the
+# bit-identical shared permeability field documented in FFAC_RECOVERY_MANIFEST.json.
+[rig]
+path = "Z:/Albus/Results/ac44/setup/rig_ffac_recovered_20260729"
+
 # Shared time grid: dense through BOTH injections, exponential in rest.
 # t=0 = injection ramp-up start; identical across all experiments.
 [data.interval.inj1_fine]

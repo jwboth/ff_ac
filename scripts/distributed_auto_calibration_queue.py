@@ -637,6 +637,22 @@ def _pending_task_info(path: Path) -> Optional[Tuple[str, int, str]]:
     return str(run), seq, phase
 
 
+def _completed_task_sequences(done_dir: Path, run: str, phase: str) -> set[int]:
+    """Return unique completed sequence numbers, ignoring retry archive copies."""
+
+    prefix = f"{run}_{phase}_"
+    sequences: set[int] = set()
+    for path in done_dir.glob(f"{prefix}*.json"):
+        task_id = path.stem.split("__", 1)[0]
+        suffix = task_id[len(prefix) :]
+        seq_text = suffix.split("_", 1)[0]
+        try:
+            sequences.add(int(seq_text))
+        except ValueError:
+            continue
+    return sequences
+
+
 def _select_pending_task(
     dirs: Dict[str, Path],
     worker_id: str,
@@ -2728,9 +2744,9 @@ def master_main(args: argparse.Namespace) -> None:
         history_source = (
             history_path if history_path.exists() else (tmp_history_path if tmp_history_path.exists() else None)
         )
-        done_warmup = sum(1 for _ in dirs["done"].glob(f"{run}_warmup_*.json"))
-        done_optuna = sum(1 for _ in dirs["done"].glob(f"{run}_optuna_*.json"))
-        done_init = sum(1 for _ in dirs["done"].glob(f"{run}_init_*.json"))
+        done_warmup = len(_completed_task_sequences(dirs["done"], run, "warmup"))
+        done_optuna = len(_completed_task_sequences(dirs["done"], run, "optuna"))
+        done_init = len(_completed_task_sequences(dirs["done"], run, "init"))
         checkpoint_paths = [
             local_state_dir / f"local_runner_{run}.checkpoint.json",
             logs_dir / f"local_runner_{run}.checkpoint.json",

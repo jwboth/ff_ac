@@ -32,6 +32,7 @@ from scripts.auto_calibrate_color_to_mass import evaluate_run, save_best_calibra
 from scripts.distributed_auto_calibration_queue import (
     _build_distributions,
     _call_with_transient_retries,
+    _completed_task_sequences,
     _load_seed_params_file,
     _merge_unique_params,
     _recover_compact_master_context,
@@ -324,6 +325,25 @@ def test_context_build_retries_only_transient_io():
             attempts=4,
             delay=0,
         )
+
+
+def test_completed_task_sequences_deduplicates_retry_archives(tmp_path):
+    done = tmp_path / "done"
+    done.mkdir()
+    names = [
+        "ac44_warmup_6_100_111__worker_0.json",
+        "ac44_warmup_6_200_222__worker_0.json",
+        "ac44_warmup_7_300_333__worker_1.json",
+        "ac44_optuna_8_400_444__worker_0.json",
+        "ac44_optuna_8_500_555__worker_0.json",
+        "ac40_warmup_6_600_666__worker_0.json",
+    ]
+    for name in names:
+        (done / name).write_text("{}", encoding="utf-8")
+
+    assert _completed_task_sequences(done, "ac44", "warmup") == {6, 7}
+    assert _completed_task_sequences(done, "ac44", "optuna") == {8}
+    assert _completed_task_sequences(done, "ac44", "init") == set()
 
 
 def test_compact_master_context_recovers_only_matching_persisted_contract(tmp_path):
