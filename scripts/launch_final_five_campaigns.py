@@ -192,9 +192,9 @@ def gpu_lanes() -> tuple[GpuLane, ...]:
             gpu_runs(VARIANT_BY_NAME["sharedpath_s17"]),
         ),
         GpuLane(
-            "opencl_sharedpath_s73",
-            "olav",
-            "opencl",
+            "cuda_sharedpath_s73",
+            "moderskipet",
+            "cuda",
             "sharedpath_s73",
             gpu_runs(VARIANT_BY_NAME["sharedpath_s73"]),
         ),
@@ -242,7 +242,7 @@ def validate_plan() -> dict:
         host: sum(1 for lane in gpu_lanes() if lane.host == host)
         for host in ("moderskipet", "olav")
     }
-    if host_gpu_counts != {"moderskipet": 3, "olav": 4}:
+    if host_gpu_counts != {"moderskipet": 4, "olav": 3}:
         raise RuntimeError(f"Unexpected GPU lane counts: {host_gpu_counts}")
     return {
         "schema": 1,
