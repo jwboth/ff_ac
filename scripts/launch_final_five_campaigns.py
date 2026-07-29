@@ -613,13 +613,21 @@ def build_process_specs(
 
 def _active_campaign_processes() -> list[dict]:
     marker = CAMPAIGN_ID.lower()
+    excluded = {os.getpid()}
+    try:
+        parent = psutil.Process(os.getpid()).parent()
+        while parent is not None:
+            excluded.add(parent.pid)
+            parent = parent.parent()
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        pass
     active = []
     for process in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             command = " ".join(process.info.get("cmdline") or [])
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
-        if process.pid == os.getpid() or marker not in command.lower():
+        if process.pid in excluded or marker not in command.lower():
             continue
         active.append(
             {

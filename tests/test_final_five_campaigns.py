@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from scripts.ac_production_campaign import (
@@ -9,6 +10,7 @@ from scripts.ac_production_campaign import (
 from scripts.launch_final_five_campaigns import (
     CAMPAIGN_ID,
     VARIANTS,
+    _active_campaign_processes,
     _variant_env,
     build_process_specs,
     cpu_runs,
@@ -105,3 +107,10 @@ def test_only_sharedpath_variants_enable_ac60_anchor():
             assert env["FFAC_COLOR_PATH_ANCHOR_STRICT"] == "on"
         else:
             assert "FFAC_COLOR_PATH_ANCHOR" not in env
+
+
+def test_active_campaign_scan_ignores_its_own_process_tree():
+    assert all(
+        process["pid"] not in {os.getpid(), os.getppid()}
+        for process in _active_campaign_processes()
+    )
