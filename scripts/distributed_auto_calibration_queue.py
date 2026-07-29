@@ -1056,6 +1056,13 @@ def _select_initial_local_run(
     return next((run for run in runs if not _run_is_complete(dirs, run)), None)
 
 
+def _remaining_local_runs(
+    dirs: Mapping[str, Path],
+    runs: Sequence[str],
+) -> List[str]:
+    return [run for run in runs if not _run_is_complete(dirs, run)]
+
+
 def _mark_run_complete(
     dirs: Mapping[str, Path],
     run: str,
@@ -2270,14 +2277,16 @@ def master_main(args: argparse.Namespace) -> None:
 
     from darsia.presets.workflows.rig import Rig
 
-    runs = args.runs
+    runs = list(args.runs)
     local_eval_backend = str(
         getattr(args, "local_eval_backend", "off") or "off"
     ).lower()
     local_eval_enabled = local_eval_backend != "off"
     requested_local_run = getattr(args, "local_run", None)
-    if requested_local_run and requested_local_run not in runs:
+    if requested_local_run and requested_local_run not in args.runs:
         raise ValueError(f"--local-run {requested_local_run!r} is not present in --runs")
+    if local_eval_enabled:
+        runs = _remaining_local_runs(dirs, runs)
     local_run: Optional[str] = (
         _select_initial_local_run(
             dirs,

@@ -32,6 +32,7 @@ from scripts.distributed_auto_calibration_queue import (
     _call_with_transient_retries,
     _load_seed_params_file,
     _merge_unique_params,
+    _remaining_local_runs,
     _seed_params_for_run,
     _select_initial_local_run,
 )
@@ -330,6 +331,10 @@ def test_local_gpu_resume_skips_completed_requested_run(tmp_path):
         )
         == "ac23"
     )
+    assert _remaining_local_runs(
+        dirs,
+        ("ac17", "ac19", "ac23"),
+    ) == ["ac19", "ac23"]
 
 
 def test_final_campaign_rejects_concurrent_trials_for_the_same_run(tmp_path):
