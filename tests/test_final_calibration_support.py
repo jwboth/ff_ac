@@ -247,7 +247,21 @@ def test_pointwise_l1_uses_equal_absolute_weight_per_frame(monkeypatch):
 def test_campaign_stop_expands_tree_and_recorded_orphan_spawn():
     marker = "Kalibrering_AC_final_test"
     records = {
-        10: ProcessRecord(10, 1, "powershell.exe", marker, 1.0),
+        5: ProcessRecord(
+            5,
+            1,
+            "python.exe",
+            "scripts/launch_final_five_campaigns.py launch",
+            0.5,
+        ),
+        6: ProcessRecord(
+            6,
+            5,
+            "python.exe",
+            "scripts/launch_final_five_campaigns.py launch",
+            0.6,
+        ),
+        10: ProcessRecord(10, 6, "powershell.exe", marker, 1.0),
         11: ProcessRecord(11, 10, "python.exe", "master", 2.0),
         12: ProcessRecord(
             12,
@@ -273,7 +287,7 @@ def test_campaign_stop_expands_tree_and_recorded_orphan_spawn():
         excluded_pids=set(),
     )
 
-    assert targets == {10, 11, 12, 20}
+    assert targets == {5, 6, 10, 11, 12, 20}
 
 
 def test_context_build_retries_only_transient_io():

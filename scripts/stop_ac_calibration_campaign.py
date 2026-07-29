@@ -22,6 +22,10 @@ import psutil
 
 
 _SPAWN_PARENT_PATTERN = re.compile(r"\bparent_pid=(\d+)\b")
+_CAMPAIGN_LAUNCHER_PATTERN = re.compile(
+    r"launch_[^\s\"']*campaigns?\.py\s+launch\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -108,7 +112,7 @@ def _expand_target_pids(
     recorded_watchdog_pids: set[int],
     excluded_pids: set[int],
 ) -> set[int]:
-    """Find marker processes, descendants, and detached spawn children."""
+    """Find marker processes, their launchers, descendants, and spawn children."""
 
     marker_lower = marker.lower()
     targets = {
@@ -117,6 +121,14 @@ def _expand_target_pids(
         if record.pid not in excluded_pids
         and marker_lower in record.command_line.lower()
     }
+
+    for pid in tuple(targets):
+        parent_pid = records[pid].ppid
+        while parent_pid in records and parent_pid not in excluded_pids:
+            parent = records[parent_pid]
+            if _CAMPAIGN_LAUNCHER_PATTERN.search(parent.command_line):
+                targets.add(parent_pid)
+            parent_pid = parent.ppid
 
     changed = True
     while changed:
