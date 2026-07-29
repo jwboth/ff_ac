@@ -12,6 +12,7 @@ from scripts.launch_final_five_campaigns import (
     VARIANTS,
     _active_campaign_processes,
     _variant_env,
+    _write_json_best_effort,
     build_process_specs,
     cpu_runs,
     gpu_lanes,
@@ -118,3 +119,19 @@ def test_active_campaign_scan_ignores_its_own_process_tree():
         process["pid"] not in {os.getpid(), os.getppid()}
         for process in _active_campaign_processes()
     )
+
+
+def test_supervisor_status_write_is_atomic_and_tolerates_io_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    status = tmp_path / "status" / "supervisor.json"
+    assert _write_json_best_effort(status, {"running": 3})
+    assert status.read_text(encoding="utf-8") == '{\n  "running": 3\n}'
+    assert not tuple(status.parent.glob(".*.tmp"))
+
+    def fail_mkdir(*args, **kwargs):
+        raise FileNotFoundError("network drive unavailable")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+    assert not _write_json_best_effort(status, {"running": 4})

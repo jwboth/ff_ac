@@ -129,6 +129,26 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _write_json_best_effort(path: Path, payload: object) -> bool:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary.replace(path)
+        return True
+    except OSError as exc:
+        print(
+            f"WARNING: could not update supervisor status {path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def _split_alternating(runs: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(runs[::2]), tuple(runs[1::2])
 
@@ -836,19 +856,16 @@ def launch(args: argparse.Namespace) -> int:
                     "queue_complete": _queue_complete(spec.queue),
                 }
             )
-        status_path.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "campaign_id": CAMPAIGN_ID,
-                    "updated_at_utc": _utc_now(),
-                    "host": socket.gethostname().upper(),
-                    "running_processes": running,
-                    "processes": status_rows,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        _write_json_best_effort(
+            status_path,
+            {
+                "schema": 1,
+                "campaign_id": CAMPAIGN_ID,
+                "updated_at_utc": _utc_now(),
+                "host": socket.gethostname().upper(),
+                "running_processes": running,
+                "processes": status_rows,
+            },
         )
         if running == 0:
             failed = [
