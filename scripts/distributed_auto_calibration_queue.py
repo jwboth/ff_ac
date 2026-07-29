@@ -584,6 +584,42 @@ def _load_json_retry(
     return None
 
 
+def _call_with_transient_retries(
+    operation: Any,
+    *,
+    label: str,
+    attempts: int = 8,
+    delay: float = 5.0,
+    log: Any = None,
+) -> Any:
+    total_attempts = max(1, int(attempts))
+    for attempt in range(total_attempts):
+        try:
+            return operation()
+        except (OSError, AssertionError) as exc:
+            missing_network_file = isinstance(exc, AssertionError) and any(
+                marker in str(exc).lower()
+                for marker in ("does not exist", "not found")
+            )
+            if (
+                not isinstance(exc, OSError)
+                and not missing_network_file
+            ) or attempt + 1 >= total_attempts:
+                raise
+            wait = min(30.0, max(0.0, delay) * (2**attempt))
+            if wait:
+                wait += random.uniform(0.0, min(2.0, wait * 0.2))
+            if log is not None:
+                log(
+                    f"{label} transient I/O failure "
+                    f"({type(exc).__name__}: {exc}); retry "
+                    f"{attempt + 2}/{total_attempts} in {wait:.1f}s"
+                )
+            gc.collect()
+            time.sleep(wait)
+    raise RuntimeError(f"{label} retry loop exhausted")
+
+
 def _pending_task_info(path: Path) -> Optional[Tuple[str, int, str]]:
     payload = _load_json_retry(path)
     if not payload:
@@ -2422,7 +2458,13 @@ def master_main(args: argparse.Namespace) -> None:
             stale_seconds=max(float(args.heartbeat_timeout_seconds), 600.0),
         ):
             raise RuntimeError(f"[{run}] could not acquire local run lease")
-        ctx = _build_full_context(run)
+        ctx = _call_with_transient_retries(
+            lambda: _build_full_context(run),
+            label=f"[{run}] context build",
+            attempts=int(os.environ.get("FFAC_CONTEXT_BUILD_ATTEMPTS", "8")),
+            delay=float(os.environ.get("FFAC_CONTEXT_BUILD_RETRY_SECONDS", "5")),
+            log=_log_master,
+        )
         run_label_weights = label_weights
         if args.use_label_weights and args.auto_label_weights and not label_weights:
             auto_weights = compute_auto_label_weights(ctx)

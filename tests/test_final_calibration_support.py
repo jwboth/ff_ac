@@ -29,6 +29,7 @@ from scripts.ac_production_campaign import (
 from scripts import auto_calibrate_color_to_mass
 from scripts.auto_calibrate_color_to_mass import evaluate_run, save_best_calibration
 from scripts.distributed_auto_calibration_queue import (
+    _call_with_transient_retries,
     _load_seed_params_file,
     _merge_unique_params,
     _seed_params_for_run,
@@ -271,6 +272,39 @@ def test_campaign_stop_expands_tree_and_recorded_orphan_spawn():
     )
 
     assert targets == {10, 11, 12, 20}
+
+
+def test_context_build_retries_only_transient_io():
+    calls = 0
+    messages = []
+
+    def succeeds_after_network_errors():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError("network file temporarily unavailable")
+        return "ready"
+
+    assert (
+        _call_with_transient_retries(
+            succeeds_after_network_errors,
+            label="[ac44] context build",
+            attempts=4,
+            delay=0,
+            log=messages.append,
+        )
+        == "ready"
+    )
+    assert calls == 3
+    assert len(messages) == 2
+
+    with pytest.raises(AssertionError, match="invalid geometry"):
+        _call_with_transient_retries(
+            lambda: (_ for _ in ()).throw(AssertionError("invalid geometry")),
+            label="[ac44] context build",
+            attempts=4,
+            delay=0,
+        )
 
 
 def test_final_campaign_rejects_concurrent_trials_for_the_same_run(tmp_path):
