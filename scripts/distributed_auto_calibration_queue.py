@@ -1046,6 +1046,16 @@ def _run_is_complete(dirs: Mapping[str, Path], run: Optional[str]) -> bool:
     return bool(run) and _safe_exists(_run_complete_path(dirs, str(run)))
 
 
+def _select_initial_local_run(
+    dirs: Mapping[str, Path],
+    runs: Sequence[str],
+    requested_run: Optional[str],
+) -> Optional[str]:
+    if requested_run and not _run_is_complete(dirs, requested_run):
+        return requested_run
+    return next((run for run in runs if not _run_is_complete(dirs, run)), None)
+
+
 def _mark_run_complete(
     dirs: Mapping[str, Path],
     run: str,
@@ -2269,9 +2279,13 @@ def master_main(args: argparse.Namespace) -> None:
     if requested_local_run and requested_local_run not in runs:
         raise ValueError(f"--local-run {requested_local_run!r} is not present in --runs")
     local_run: Optional[str] = (
-        str(requested_local_run)
-        if local_eval_enabled and requested_local_run
-        else (runs[0] if local_eval_enabled and runs else None)
+        _select_initial_local_run(
+            dirs,
+            runs,
+            str(requested_local_run) if requested_local_run else None,
+        )
+        if local_eval_enabled
+        else None
     )
     local_owner = f"local_master_{_hostname()}_{os.getpid()}"
     local_provenance = (
