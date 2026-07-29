@@ -86,6 +86,10 @@ def test_process_specs_enforce_full_budget_depth_and_sequential_optuna(
             assert command[command.index("--warmup-iters") + 1] == "150"
             assert command[command.index("--max-in-flight-per-run") + 1] == "1"
             assert "--no-save-calibration" in command
+            if spec.kind == "gpu":
+                assert "--optuna-persist" not in command
+            else:
+                assert command[command.index("--optuna-persist") + 1] == "true"
         assert spec.env["FFAC_REQUIRE_VARYING_DEPTH"] == "on"
         assert (
             spec.env["FFAC_EXPECTED_DEPTH_SHA256"]

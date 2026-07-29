@@ -435,8 +435,6 @@ def _master_command(
         str(seed_path),
         "--optuna-seed",
         str(variant.seed),
-        "--optuna-persist",
-        "true",
         "--optuna-storage-dir",
         str(optuna_dir),
         "--max-iters",
@@ -458,6 +456,8 @@ def _master_command(
         "--quality-dtype",
         "float32",
     ]
+    if not local_backend:
+        command.extend(["--optuna-persist", "true"])
     if local_backend:
         command.extend(
             [
