@@ -3506,7 +3506,7 @@ def master_main(args: argparse.Namespace) -> None:
                     _cf = state.context.calibration_folder
                     out_folder = (
                         _cf.parent / (_cf.name + "_auto_opt")
-                        if _cf
+                        if _cf and not args.no_save_calibration
                         else logs_dir / f"{state.run}_auto_opt"
                     )
                     _finalize_run(
@@ -3649,7 +3649,11 @@ def master_main(args: argparse.Namespace) -> None:
                 if state.optuna_done >= state.max_iters:
                     state.phase = "done"
                     _cf = state.context.calibration_folder
-                    out_folder = (_cf.parent / (_cf.name + "_auto_opt")) if _cf else (logs_dir / f"{state.run}_auto_opt")
+                    out_folder = (
+                        _cf.parent / (_cf.name + "_auto_opt")
+                        if _cf and not args.no_save_calibration
+                        else logs_dir / f"{state.run}_auto_opt"
+                    )
                     _finalize_run(
                         state,
                         logs_dir,
