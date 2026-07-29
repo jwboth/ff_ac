@@ -44,6 +44,7 @@ import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
@@ -70,6 +71,7 @@ if memmap_root:
 
 from auto_calibrate_color_to_mass import (  # noqa: E402
     PENALTY_VALUE,
+    build_param_space,
     build_context,
     compute_auto_label_weights,
     depth_map_identity,
@@ -1881,6 +1883,191 @@ def _build_distributions(
     return distributions
 
 
+def _recover_compact_master_context(
+    *,
+    run: str,
+    dirs: Mapping[str, Path],
+    args: argparse.Namespace,
+    bounds_map: Mapping[str, Any],
+    label_weights: Mapping[int, float],
+    signal_parameterization: str,
+    phase_separation: str,
+    color_path_anchor: str,
+    color_path_anchor_weight: float,
+    color_path_anchor_strict: bool,
+) -> Optional[Any]:
+    """Recover a queue-only master context from its persisted run contract.
+
+    Distributed workers build and evaluate the full image context. A
+    ``--no-save-calibration`` master only needs the parameter space to resume
+    ask/tell after a restart. Reconstruct that space only when both a completed
+    task and a persisted Optuna trial prove the exact names and distributions
+    that this same run already used.
+    """
+
+    if (
+        not bool(getattr(args, "no_save_calibration", False))
+        or not bool(getattr(args, "optuna_persist", False))
+        or not getattr(args, "optuna_storage_dir", None)
+        or signal_parameterization != "per-label"
+        or phase_separation != "shared-signal"
+    ):
+        return None
+
+    def _same_path(left: Any, right: Any) -> bool:
+        if left in (None, "") or right in (None, ""):
+            return left in (None, "") and right in (None, "")
+        try:
+            return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(
+                str(Path(right).resolve())
+            )
+        except OSError:
+            return os.path.normcase(str(Path(left))) == os.path.normcase(str(Path(right)))
+
+    expected_task_contract = {
+        "use_facies": bool(args.use_facies),
+        "per_label_params": bool(args.per_label),
+        "use_label_weights": bool(args.use_label_weights),
+        "enforce_lower": bool(args.enforce_lower),
+        "objective_integral": str(args.objective_integral),
+        "signal_parameterization": signal_parameterization,
+        "phase_separation": phase_separation,
+        "color_path_anchor": color_path_anchor,
+        "color_path_anchor_strict": bool(color_path_anchor_strict),
+    }
+    expected_quality = _build_quality_spec(args.quality_scale, args.quality_dtype)
+
+    task_payload: Optional[Dict[str, Any]] = None
+    done_dir = dirs.get("done")
+    if done_dir is None:
+        return None
+    try:
+        candidates = sorted(
+            Path(done_dir).glob(f"{run}_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for task_path in candidates:
+        payload = _load_json_retry(task_path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("params"), dict):
+            continue
+        if str(payload.get("run", "")).lower() != run.lower():
+            continue
+        if not _same_path(payload.get("config_dir"), args.config_dir):
+            continue
+        if not _same_path(payload.get("bounds_file"), args.bounds_file):
+            continue
+        if any(payload.get(key) != value for key, value in expected_task_contract.items()):
+            continue
+        try:
+            if not math.isclose(
+                float(payload.get("color_path_anchor_weight")),
+                float(color_path_anchor_weight),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if payload.get("quality") != expected_quality:
+            continue
+        payload_weights = {
+            int(key): float(value)
+            for key, value in (payload.get("label_weights") or {}).items()
+        }
+        if payload_weights != {
+            int(key): float(value) for key, value in label_weights.items()
+        }:
+            continue
+        task_payload = payload
+        task_payload["_resume_task_path"] = str(task_path)
+        break
+    if task_payload is None:
+        return None
+
+    labels: set[int] = set()
+    max_value_index = 0
+    task_params = task_payload["params"]
+    for name in task_params:
+        parsed = _parse_signal_name(str(name))
+        if parsed is None:
+            continue
+        label, value_index = parsed
+        labels.add(int(label))
+        max_value_index = max(max_value_index, int(value_index))
+    if not labels or max_value_index < 1:
+        return None
+
+    param_space = build_param_space(
+        run,
+        bounds_map,
+        signal_labels=sorted(labels),
+        per_label_params=bool(args.per_label),
+        use_facies=bool(args.use_facies),
+        n_free_values=max_value_index,
+        signal_parameterization=signal_parameterization,
+    )
+    expected_distributions = _build_distributions(param_space)
+    if set(task_params) != set(expected_distributions):
+        return None
+    for entry in param_space:
+        try:
+            value = float(task_params[entry["name"]])
+            low, high = (float(bound) for bound in entry["bounds"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if value < low - 1e-12 or value > high + 1e-12:
+            return None
+
+    storage_path = Path(args.optuna_storage_dir) / f"optuna_{run}.db"
+    if not storage_path.exists():
+        return None
+    study: Optional[optuna.Study] = None
+    matching_trials = 0
+    try:
+        study = optuna.load_study(
+            study_name=f"{run}_optuna",
+            storage=f"sqlite:///{storage_path}",
+        )
+        for trial in study.trials:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            if set(trial.distributions) != set(expected_distributions):
+                continue
+            if all(
+                trial.distributions[name] == distribution
+                for name, distribution in expected_distributions.items()
+            ):
+                matching_trials += 1
+    except Exception:
+        return None
+    finally:
+        if study is not None:
+            try:
+                study._storage.remove_session()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    if matching_trials < 1:
+        return None
+
+    return SimpleNamespace(
+        run=run,
+        param_space=param_space,
+        calibration_folder=None,
+        signal_label=None,
+        signal_labels=sorted(labels),
+        per_label_params=bool(args.per_label),
+        label_weights=dict(label_weights),
+        signal_parameterization=signal_parameterization,
+        phase_separation=phase_separation,
+        _loaded=[],
+        _resume_task_path=task_payload["_resume_task_path"],
+        _resume_matching_trials=matching_trials,
+    )
+
+
 def _finalize_run(
     run_state: RunState,
     logs_dir: Path,
@@ -2481,13 +2668,43 @@ def master_main(args: argparse.Namespace) -> None:
             stale_seconds=max(float(args.heartbeat_timeout_seconds), 600.0),
         ):
             raise RuntimeError(f"[{run}] could not acquire local run lease")
-        ctx = _call_with_transient_retries(
-            lambda: _build_full_context(run),
-            label=f"[{run}] context build",
-            attempts=int(os.environ.get("FFAC_CONTEXT_BUILD_ATTEMPTS", "8")),
-            delay=float(os.environ.get("FFAC_CONTEXT_BUILD_RETRY_SECONDS", "5")),
-            log=_log_master,
-        )
+        light_master = os.environ.get("FFAC_MASTER_LIGHT_CONTEXT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        ctx = None
+        if light_master and not local_eval_enabled:
+            ctx = _recover_compact_master_context(
+                run=run,
+                dirs=dirs,
+                args=args,
+                bounds_map=bounds_map,
+                label_weights=label_weights,
+                signal_parameterization=signal_parameterization,
+                phase_separation=phase_separation,
+                color_path_anchor=os.environ.get("FFAC_COLOR_PATH_ANCHOR", ""),
+                color_path_anchor_weight=color_path_anchor_weight,
+                color_path_anchor_strict=os.environ.get(
+                    "FFAC_COLOR_PATH_ANCHOR_STRICT", ""
+                ).strip().lower()
+                in {"1", "true", "yes", "on"},
+            )
+            if ctx is not None:
+                _log_master(
+                    f"[{run}] recovered compact master context from "
+                    f"{ctx._resume_matching_trials} persisted trial(s); "
+                    f"contract={ctx._resume_task_path}"
+                )
+        if ctx is None:
+            ctx = _call_with_transient_retries(
+                lambda: _build_full_context(run),
+                label=f"[{run}] context build",
+                attempts=int(os.environ.get("FFAC_CONTEXT_BUILD_ATTEMPTS", "8")),
+                delay=float(os.environ.get("FFAC_CONTEXT_BUILD_RETRY_SECONDS", "5")),
+                log=_log_master,
+            )
         run_label_weights = label_weights
         if args.use_label_weights and args.auto_label_weights and not label_weights:
             auto_weights = compute_auto_label_weights(ctx)

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import optuna
 import pytest
 
 from darsia.multiphase.flash import SimpleFlash, TitrationFlash
@@ -29,9 +30,11 @@ from scripts.ac_production_campaign import (
 from scripts import auto_calibrate_color_to_mass
 from scripts.auto_calibrate_color_to_mass import evaluate_run, save_best_calibration
 from scripts.distributed_auto_calibration_queue import (
+    _build_distributions,
     _call_with_transient_retries,
     _load_seed_params_file,
     _merge_unique_params,
+    _recover_compact_master_context,
     _remaining_local_runs,
     _seed_params_for_run,
     _select_initial_local_run,
@@ -321,6 +324,118 @@ def test_context_build_retries_only_transient_io():
             attempts=4,
             delay=0,
         )
+
+
+def test_compact_master_context_recovers_only_matching_persisted_contract(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    bounds_file = tmp_path / "bounds.json"
+    bounds_file.write_text("{}", encoding="utf-8")
+    done_dir = tmp_path / "done"
+    done_dir.mkdir()
+    storage_dir = tmp_path / "optuna"
+    storage_dir.mkdir()
+
+    param_space = auto_calibrate_color_to_mass.build_param_space(
+        "ac44",
+        {},
+        signal_labels=[1, 2, 5, 7, 8],
+        per_label_params=True,
+        use_facies=True,
+        n_free_values=6,
+        signal_parameterization="per-label",
+    )
+    distributions = _build_distributions(param_space)
+    params = {
+        entry["name"]: 0.5 * (float(entry["bounds"][0]) + float(entry["bounds"][1]))
+        for entry in param_space
+    }
+    task_payload = {
+        "run": "ac44",
+        "params": params,
+        "config_dir": str(config_dir),
+        "bounds_file": str(bounds_file),
+        "use_facies": True,
+        "per_label_params": True,
+        "use_label_weights": False,
+        "label_weights": {},
+        "enforce_lower": False,
+        "objective_integral": "off",
+        "signal_parameterization": "per-label",
+        "phase_separation": "shared-signal",
+        "color_path_anchor": "",
+        "color_path_anchor_weight": 0.75,
+        "color_path_anchor_strict": False,
+        "quality": {"scale": 1.0, "dtype": "float32"},
+    }
+    task_path = done_dir / "ac44_warmup_0.json"
+    task_path.write_text(json.dumps(task_payload), encoding="utf-8")
+
+    storage_path = storage_dir / "optuna_ac44.db"
+    study = optuna.create_study(
+        direction="minimize",
+        study_name="ac44_optuna",
+        storage=f"sqlite:///{storage_path}",
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            params=params,
+            distributions=distributions,
+            value=1.0,
+        )
+    )
+    study._storage.remove_session()
+
+    args = SimpleNamespace(
+        no_save_calibration=True,
+        optuna_persist=True,
+        optuna_storage_dir=str(storage_dir),
+        config_dir=str(config_dir),
+        bounds_file=str(bounds_file),
+        use_facies=True,
+        per_label=True,
+        use_label_weights=False,
+        enforce_lower=False,
+        objective_integral="off",
+        quality_scale=1.0,
+        quality_dtype="float32",
+    )
+    context = _recover_compact_master_context(
+        run="ac44",
+        dirs={"done": done_dir},
+        args=args,
+        bounds_map={},
+        label_weights={},
+        signal_parameterization="per-label",
+        phase_separation="shared-signal",
+        color_path_anchor="",
+        color_path_anchor_weight=0.75,
+        color_path_anchor_strict=False,
+    )
+
+    assert context is not None
+    assert context.run == "ac44"
+    assert context.signal_labels == [1, 2, 5, 7, 8]
+    assert context._resume_matching_trials == 1
+    assert _build_distributions(context.param_space) == distributions
+
+    task_payload["phase_separation"] = "residual-gas"
+    task_path.write_text(json.dumps(task_payload), encoding="utf-8")
+    assert (
+        _recover_compact_master_context(
+            run="ac44",
+            dirs={"done": done_dir},
+            args=args,
+            bounds_map={},
+            label_weights={},
+            signal_parameterization="per-label",
+            phase_separation="shared-signal",
+            color_path_anchor="",
+            color_path_anchor_weight=0.75,
+            color_path_anchor_strict=False,
+        )
+        is None
+    )
 
 
 def test_local_gpu_resume_skips_completed_requested_run(tmp_path):
